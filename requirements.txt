@@ -1,0 +1,7 @@
+PyQt6
+pyqtgraph
+numpy
+tifffile
+opencv-python
+imagecodecs
+scikit-image
