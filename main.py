@@ -25,6 +25,10 @@ from operations import (
     OPERATION_REGISTRY,
 )
 from pipeline import Pipeline
+from measurement import (
+    FacetSession, line_segment_across_box,
+    sessions_to_json, sessions_from_json, sessions_to_csv,
+)
 
 pg.setConfigOptions(antialias=True)
 
@@ -1789,6 +1793,494 @@ class PipelinePanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Facet thickness measurement
+# ---------------------------------------------------------------------------
+
+FACET_COLORS = [
+    (255, 196,   0),   # amber
+    (  0, 200, 255),   # cyan
+    (255, 110, 180),   # pink
+    (120, 255, 120),   # green
+    (200, 140, 255),   # violet
+    (255, 140,  60),   # orange
+]
+
+
+class FacetGraphics:
+    """The pyqtgraph items that draw one FacetSession on the image.
+
+    Held persistently per session and refreshed with setData rather than
+    rebuilt, so dragging a point stays cheap. All coordinates are image /
+    ViewBox coordinates, so the overlay stays anchored through zoom and pan.
+    """
+
+    def __init__(self, view_box, color):
+        self.view_box = view_box
+        self.color = color
+        pen = pg.mkPen(color=color + (220,), width=1.6)
+
+        # Fitted interface line, extended across the visible image.
+        self.line_item = pg.PlotDataItem(pen=pen)
+        self.line_item.setZValue(10)
+
+        # Perpendicular drops: deliberately light so they do not obscure the
+        # interface being measured.
+        self.perp_item = pg.PlotDataItem(
+            pen=pg.mkPen(color=color + (110,), width=1.0), connect='pairs'
+        )
+        self.perp_item.setZValue(10)
+
+        # Interface points: filled circles. Surface points: hollow squares.
+        self.interface_scatter = pg.ScatterPlotItem(
+            symbol='o', size=9, brush=pg.mkBrush(color + (230,)),
+            pen=pg.mkPen(color=(20, 20, 20, 200), width=1),
+        )
+        self.interface_scatter.setZValue(11)
+        self.surface_scatter = pg.ScatterPlotItem(
+            symbol='s', size=10, brush=pg.mkBrush(0, 0, 0, 0),
+            pen=pg.mkPen(color=color + (255,), width=2),
+        )
+        self.surface_scatter.setZValue(11)
+
+        self.labels: list[pg.TextItem] = []
+
+        for item in (self.line_item, self.perp_item,
+                     self.interface_scatter, self.surface_scatter):
+            view_box.addItem(item)
+
+    # -- helpers ---------------------------------------------------------
+
+    def _label_pool(self, n):
+        """Grow/shrink the TextItem pool to exactly n visible labels."""
+        while len(self.labels) < n:
+            t = pg.TextItem(color=self.color, anchor=(0.0, 0.5),
+                            fill=(20, 20, 20, 150))
+            t.setZValue(12)
+            self.view_box.addItem(t)
+            self.labels.append(t)
+        for i, t in enumerate(self.labels):
+            t.setVisible(i < n)
+
+    def set_visible(self, visible):
+        for item in (self.line_item, self.perp_item,
+                     self.interface_scatter, self.surface_scatter):
+            item.setVisible(visible)
+        if not visible:
+            for t in self.labels:
+                t.setVisible(False)
+
+    def update(self, session, image_hw, show_labels=True):
+        """Redraw everything for this session."""
+        interface = np.asarray(session.interface_points, dtype=np.float64).reshape(-1, 2)
+        surface = np.asarray(session.surface_points, dtype=np.float64).reshape(-1, 2)
+
+        self.interface_scatter.setData(x=interface[:, 0], y=interface[:, 1])
+        self.surface_scatter.setData(x=surface[:, 0], y=surface[:, 1])
+
+        fit = session.fit()
+        if fit is None or image_hw is None:
+            self.line_item.setData(x=[], y=[])
+            self.perp_item.setData(x=[], y=[])
+            self._label_pool(0)
+            return
+
+        origin, direction, _ = fit
+        h, w = image_hw
+        p0, p1 = line_segment_across_box(origin, direction, 0.0, float(w), 0.0, float(h))
+        self.line_item.setData(x=[p0[0], p1[0]], y=[p0[1], p1[1]])
+
+        measurements = session.measurements()
+        if not measurements:
+            self.perp_item.setData(x=[], y=[])
+            self._label_pool(0)
+            return
+
+        xs, ys = [], []
+        for m in measurements:
+            xs += [m.outer_x, m.foot_x]
+            ys += [m.outer_y, m.foot_y]
+        self.perp_item.setData(x=np.array(xs), y=np.array(ys))
+
+        if not show_labels:
+            self._label_pool(0)
+            return
+
+        unit = session.unit
+        self._label_pool(len(measurements))
+        for t, m in zip(self.labels, measurements):
+            value = session.to_units(m.thickness_px)
+            t.setText(f"{value:.3g} {unit}")
+            t.setColor(pg.mkColor((255, 90, 90)) if m.sign_anomalous
+                       else pg.mkColor(self.color))
+            t.setPos(m.outer_x + 4, m.outer_y)
+
+    def remove(self):
+        for item in (self.line_item, self.perp_item,
+                     self.interface_scatter, self.surface_scatter):
+            self.view_box.removeItem(item)
+        for t in self.labels:
+            self.view_box.removeItem(t)
+        self.labels.clear()
+
+
+class FacetThicknessPanel(QWidget):
+    """Floating tool window driving the two-phase facet thickness workflow.
+
+    Phase A: click points along the film/substrate interface; a total-least-
+    squares line is fitted through them live. Phase B: click points on the
+    outer film surface; each gets a perpendicular dropped onto the fitted
+    interface line and labelled with the thickness.
+
+    Purely additive: nothing here touches the processing pipeline. Points are
+    placed on the displayed geometry, in the same coordinate space as the
+    existing measurement rays.
+    """
+
+    def __init__(self, main_app):
+        super().__init__(main_app, Qt.WindowType.Tool)
+        self.main_app = main_app
+        self.setWindowTitle("Facet Thickness")
+        self.setGeometry(1150, 640, 420, 640)
+        self._updating = False
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
+
+        # --- phase / mode banner ---
+        self.phase_label = QLabel("No session. Click “New Session” to begin.")
+        self.phase_label.setWordWrap(True)
+        self.phase_label.setStyleSheet("font-weight: bold;")
+        outer.addWidget(self.phase_label)
+
+        self.hint_label = QLabel("")
+        self.hint_label.setWordWrap(True)
+        self.hint_label.setStyleSheet("color: #ffb020; font-size: 11px;")
+        self.hint_label.setVisible(False)
+        outer.addWidget(self.hint_label)
+
+        # --- session list ---
+        outer.addWidget(QLabel("Sessions (uncheck to hide):"))
+        self.session_list = QListWidget()
+        self.session_list.setMaximumHeight(110)
+        self.session_list.currentRowChanged.connect(self._on_session_selected)
+        self.session_list.itemChanged.connect(self._on_session_item_changed)
+        outer.addWidget(self.session_list)
+
+        row1 = QHBoxLayout()
+        self.new_btn = QPushButton("New Session")
+        self.new_btn.clicked.connect(self._on_new_session)
+        row1.addWidget(self.new_btn)
+        self.finish_btn = QPushButton("Finish Interface")
+        self.finish_btn.clicked.connect(self._on_finish_interface)
+        row1.addWidget(self.finish_btn)
+        outer.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        self.undo_btn = QPushButton("Undo Last Point")
+        self.undo_btn.clicked.connect(self._on_undo)
+        row2.addWidget(self.undo_btn)
+        self.delete_btn = QPushButton("Delete Selected")
+        self.delete_btn.clicked.connect(self._on_delete_selected)
+        row2.addWidget(self.delete_btn)
+        self.clear_btn = QPushButton("Clear Session")
+        self.clear_btn.clicked.connect(self._on_clear_session)
+        row2.addWidget(self.clear_btn)
+        outer.addLayout(row2)
+
+        # --- summary ---
+        self.summary_label = QLabel("—")
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet("font-family: monospace; font-size: 11px;")
+        outer.addWidget(self.summary_label)
+
+        self.angle_hint_label = QLabel("")
+        self.angle_hint_label.setWordWrap(True)
+        self.angle_hint_label.setStyleSheet("font-size: 11px; color: #888;")
+        outer.addWidget(self.angle_hint_label)
+
+        # --- measurement table ---
+        from PyQt6.QtWidgets import QTableWidget, QAbstractItemView
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["#", "foot x", "thickness", "flag"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setMaximumHeight(170)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        outer.addWidget(self.table)
+
+        # --- thickness vs x plot ---
+        self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setLabel('bottom', 'Foot x (px)')
+        self.plot_widget.setLabel('left', 'Thickness (px)')
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_widget.addLegend(offset=(-10, 10))
+        self.plot_widget.setMinimumHeight(150)
+        outer.addWidget(self.plot_widget, stretch=1)
+        self._plot_items: list[pg.ScatterPlotItem] = []
+
+        # --- persistence ---
+        row3 = QHBoxLayout()
+        save_btn = QPushButton("Save JSON…")
+        save_btn.clicked.connect(main_app.save_facet_sessions_dialog)
+        row3.addWidget(save_btn)
+        load_btn = QPushButton("Load JSON…")
+        load_btn.clicked.connect(main_app.load_facet_sessions_dialog)
+        row3.addWidget(load_btn)
+        csv_btn = QPushButton("Export CSV…")
+        csv_btn.clicked.connect(main_app.export_facet_csv_dialog)
+        row3.addWidget(csv_btn)
+        outer.addLayout(row3)
+
+    # ------------------------------------------------------------------
+    # Convenience
+    # ------------------------------------------------------------------
+
+    @property
+    def sessions(self):
+        return self.main_app.facet_sessions
+
+    def active_session(self):
+        return self.main_app.active_facet_session()
+
+    # ------------------------------------------------------------------
+    # Button handlers
+    # ------------------------------------------------------------------
+
+    def _on_new_session(self):
+        from PyQt6.QtWidgets import QInputDialog
+        if self.main_app.sequence_manager is None:
+            QMessageBox.warning(self, "No Sequence", "Open a TIFF sequence first.")
+            return
+        default = f"facet{len(self.sessions) + 1}"
+        label, ok = QInputDialog.getText(self, "New Facet Session",
+                                         "Session label (e.g. upleg, downleg):",
+                                         text=default)
+        if not ok:
+            return
+        label = label.strip() or default
+        self.main_app.new_facet_session(label)
+
+    def _on_finish_interface(self):
+        session = self.active_session()
+        if session is None:
+            return
+        if not session.finish_interface():
+            QMessageBox.information(
+                self, "Not Enough Points",
+                "Click at least 2 interface points before finishing the interface."
+            )
+            return
+        self.main_app.facet_mode = 'surface'
+        self.main_app.refresh_facets()
+
+    def _on_undo(self):
+        session = self.active_session()
+        if session is None:
+            return
+        session.undo_last()
+        self.main_app.refresh_facets()
+
+    def _on_delete_selected(self):
+        """Delete the surface points backing the selected table rows."""
+        session = self.active_session()
+        if session is None:
+            return
+        rows = sorted({idx.row() for idx in self.table.selectionModel().selectedRows()},
+                      reverse=True)
+        if not rows:
+            self.main_app.status_label.setText(
+                "Select one or more rows in the facet table to delete."
+            )
+            return
+        for row in rows:
+            session.remove_point("surface", row)
+        self.main_app.refresh_facets()
+
+    def _on_clear_session(self):
+        session = self.active_session()
+        if session is None:
+            return
+        reply = QMessageBox.question(
+            self, "Clear Session",
+            f"Delete session “{session.label}” and all of its points?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.main_app.delete_facet_session(session)
+
+    def _on_session_selected(self, row):
+        if self._updating:
+            return
+        self.main_app.set_active_facet_session(row)
+
+    def _on_session_item_changed(self, item):
+        if self._updating:
+            return
+        row = self.session_list.row(item)
+        if 0 <= row < len(self.sessions):
+            self.sessions[row].visible = (item.checkState() == Qt.CheckState.Checked)
+            self.main_app.refresh_facets()
+
+    # ------------------------------------------------------------------
+    # Refresh
+    # ------------------------------------------------------------------
+
+    def refresh(self):
+        self._updating = True
+        try:
+            self._refresh_session_list()
+            self._refresh_banner()
+            self._refresh_summary()
+            self._refresh_table()
+            self._refresh_plot()
+        finally:
+            self._updating = False
+
+    def _refresh_session_list(self):
+        active_idx = self.main_app.active_facet_idx
+        if self.session_list.count() != len(self.sessions):
+            self.session_list.clear()
+            for s in self.sessions:
+                item = QListWidgetItem()
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                self.session_list.addItem(item)
+        for i, s in enumerate(self.sessions):
+            item = self.session_list.item(i)
+            frame_note = "" if s.frame_idx == self.main_app.current_frame else \
+                f"  [frame {s.frame_idx + 1}]"
+            item.setText(f"{s.label}   ({len(s.interface_points)} iface, "
+                         f"{len(s.surface_points)} surf){frame_note}")
+            item.setCheckState(Qt.CheckState.Checked if s.visible else Qt.CheckState.Unchecked)
+            item.setForeground(QColor(*FACET_COLORS[s.color_idx % len(FACET_COLORS)]))
+        if 0 <= active_idx < self.session_list.count():
+            self.session_list.setCurrentRow(active_idx)
+
+    def _refresh_banner(self):
+        session = self.active_session()
+        mode = self.main_app.facet_mode
+        if session is None:
+            self.phase_label.setText("No session. Click “New Session” to begin.")
+        elif session.phase == "interface":
+            state = "clicking" if mode == 'interface' else "paused"
+            self.phase_label.setText(
+                f"“{session.label}” — Phase A ({state}): click points along the "
+                f"film/substrate interface, then “Finish Interface”."
+            )
+        else:
+            state = "clicking" if mode == 'surface' else "paused"
+            self.phase_label.setText(
+                f"“{session.label}” — Phase B ({state}): click points on the outer "
+                f"film surface. Each is dropped perpendicular to the interface."
+            )
+
+        hints = []
+        if self.main_app.pipeline.scale is None:
+            hints.append("No pixel scale set — all values shown in pixels. "
+                         "Calibrate via Tools → Set Scale… (Ctrl+M).")
+        if session is not None and session.geometry_tag and \
+                session.geometry_tag != self.main_app._facet_geometry_tag():
+            hints.append("Rotation/crop changed since this session was measured — "
+                         "the points no longer line up with the displayed image. "
+                         "Recorded thicknesses are still valid.")
+        self.hint_label.setText("  ".join(hints))
+        self.hint_label.setVisible(bool(hints))
+
+    def _refresh_summary(self):
+        session = self.active_session()
+        if session is None:
+            self.summary_label.setText("—")
+            self.angle_hint_label.setText("")
+            return
+        s = session.summary()
+        unit = s["unit"]
+        if s["angle_deg"] is None:
+            self.summary_label.setText(
+                f"Interface: {s['n_interface']} point(s) — need ≥ 2 for a fit."
+            )
+            self.angle_hint_label.setText("")
+            return
+
+        text = (
+            f"Facet angle: {s['angle_deg']:.2f}°    "
+            f"Fit RMS: {s['rms_residual']:.4g} {unit} "
+            f"({s['rms_residual_px']:.3g} px, n={s['n_interface']})\n"
+        )
+        if s["n"]:
+            text += (
+                f"Thickness ({unit}): n={s['n']}  mean={s['mean']:.4g}  "
+                f"median={s['median']:.4g}  std={s['std']:.4g}\n"
+                f"                 min={s['min']:.4g}  max={s['max']:.4g}"
+            )
+        else:
+            text += "Thickness: no surface points yet."
+        self.summary_label.setText(text)
+
+        colour = "#5ad65a" if s["hint_status"] == "match" else "#888"
+        self.angle_hint_label.setStyleSheet(f"font-size: 11px; color: {colour};")
+        self.angle_hint_label.setText(s["hint"] or "")
+
+    def _refresh_table(self):
+        from PyQt6.QtWidgets import QTableWidgetItem
+        session = self.active_session()
+        measurements = session.measurements() if session is not None else []
+        unit = session.unit if session is not None else "px"
+        self.table.setHorizontalHeaderLabels(
+            ["#", f"foot x ({unit})", f"thickness ({unit})", "flag"]
+        )
+        self.table.setRowCount(len(measurements))
+        for i, m in enumerate(measurements):
+            values = [
+                str(i + 1),
+                f"{session.to_units(m.foot_x):.4g}",
+                f"{session.to_units(m.thickness_px):.4g}",
+                "wrong side?" if m.sign_anomalous else "",
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if m.sign_anomalous:
+                    item.setForeground(QColor(255, 90, 90))
+                self.table.setItem(i, col, item)
+
+    def _refresh_plot(self):
+        for item in self._plot_items:
+            self.plot_widget.removeItem(item)
+        self._plot_items.clear()
+        legend = self.plot_widget.plotItem.legend
+        if legend is not None:
+            legend.clear()
+
+        unit = "px"
+        symbols = ['o', 's', 't', 'd', '+', 'x']
+        for i, session in enumerate(self.sessions):
+            measurements = session.measurements()
+            if not measurements or not session.visible:
+                continue
+            if session.unit_per_px is not None:
+                unit = session.unit
+            xs = np.array([session.to_units(m.foot_x) for m in measurements])
+            ys = np.array([session.to_units(m.thickness_px) for m in measurements])
+            colour = FACET_COLORS[session.color_idx % len(FACET_COLORS)]
+            item = pg.ScatterPlotItem(
+                x=xs, y=ys, symbol=symbols[session.color_idx % len(symbols)],
+                size=8, brush=pg.mkBrush(colour + (200,)),
+                pen=pg.mkPen(colour + (255,)),
+            )
+            self.plot_widget.addItem(item)
+            if legend is not None:
+                legend.addItem(item, session.label)
+            self._plot_items.append(item)
+
+        self.plot_widget.setLabel('bottom', f'Foot x ({unit})')
+        self.plot_widget.setLabel('left', f'Thickness ({unit})')
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh()
+
+
+# ---------------------------------------------------------------------------
 # Main Application
 # ---------------------------------------------------------------------------
 
@@ -1831,6 +2323,15 @@ class TiffViewerApp(QMainWindow):
 
         self.rays = []
         self.ray_mode = None
+
+        # Facet thickness measurement state. facet_mode is None when idle,
+        # 'interface' while collecting phase-A points, 'surface' for phase B.
+        # Points live in display (ViewBox) coordinates, the same space as rays.
+        self.facet_sessions: list[FacetSession] = []
+        self.active_facet_idx = -1
+        self.facet_mode = None
+        self._facet_graphics: dict[int, FacetGraphics] = {}  # id(session) → items
+        self._facet_drag = None  # (session, kind, index) while dragging a point
 
         # Measurement / pixel-scale state. measure_mode is False when idle,
         # 'await_first' before the first click lands an anchor, then
@@ -1915,6 +2416,7 @@ class TiffViewerApp(QMainWindow):
         self.perf_window = PerformanceToolWindow(self)
         self.blob_size_window = BlobSizeAnalysisWindow(self)
         self.region_props_window = RegionPropsWindow(self)
+        self.facet_panel = FacetThicknessPanel(self)
 
         self.create_menus()
 
@@ -2331,6 +2833,22 @@ class TiffViewerApp(QMainWindow):
         clear_scale_action = QAction("Clear Scale", self)
         clear_scale_action.triggered.connect(self.clear_scale)
         tools_menu.addAction(clear_scale_action)
+
+        tools_menu.addSeparator()
+
+        facet_action = QAction("Facet Thickness Panel", self)
+        facet_action.setShortcut("Ctrl+Shift+P")
+        facet_action.setToolTip(
+            "Measure thin-film thickness perpendicular to a slanted substrate facet.\n"
+            "Two-phase: click the interface, then click the outer surface."
+        )
+        facet_action.triggered.connect(self.toggle_facet_panel)
+        tools_menu.addAction(facet_action)
+
+        facet_start_action = QAction("Start / Resume Facet Clicking", self)
+        facet_start_action.setShortcut("Ctrl+Shift+A")
+        facet_start_action.triggered.connect(self._facet_start_or_resume)
+        tools_menu.addAction(facet_start_action)
 
     # ------------------------------------------------------------------
     # Legacy Analysis menu shims (delegate to pipeline ops)
@@ -2924,6 +3442,302 @@ class TiffViewerApp(QMainWindow):
         self.rays.clear()
 
     # ------------------------------------------------------------------
+    # Facet thickness measurement
+    #
+    # Purely additive: none of this reads or mutates the processing pipeline
+    # beyond borrowing pipeline.scale for unit conversion. Points are clicked
+    # on the displayed geometry, in the same coordinate space as the rays.
+    # ------------------------------------------------------------------
+
+    def _facet_geometry_tag(self) -> str:
+        """Tag the display geometry so stale sessions can be spotted.
+
+        Points are stored in display coordinates, so a later rotate or crop
+        moves the image out from under them. Sessions record the tag in force
+        when they were measured; the panel compares and warns.
+        """
+        _, rot_op = self._find_op(RotateOp)
+        k = rot_op.params.get("k", 0) if (rot_op is not None and rot_op.enabled) else 0
+        region = self._crop_region()
+        crop = "none" if region is None else ",".join(str(v) for v in region)
+        return f"rot{k}|crop{crop}"
+
+    def active_facet_session(self):
+        if 0 <= self.active_facet_idx < len(self.facet_sessions):
+            return self.facet_sessions[self.active_facet_idx]
+        return None
+
+    def toggle_facet_panel(self):
+        if self.facet_panel.isVisible():
+            self.facet_panel.hide()
+            self._exit_facet_mode()
+        else:
+            self.facet_panel.show()
+            self.facet_panel.raise_()
+            self.refresh_facets()
+
+    def new_facet_session(self, label):
+        session = FacetSession(
+            label=label,
+            source_filename=(self.sequence_manager.files[self.current_frame]
+                             if self.sequence_manager is not None else ""),
+            folder_path=(self.sequence_manager.folder_path
+                         if self.sequence_manager is not None else ""),
+            frame_idx=self.current_frame,
+            scale=dict(self.pipeline.scale) if self.pipeline.scale else None,
+            color_idx=len(self.facet_sessions),
+            geometry_tag=self._facet_geometry_tag(),
+        )
+        self.facet_sessions.append(session)
+        self.active_facet_idx = len(self.facet_sessions) - 1
+        self.facet_mode = 'interface'
+        self.glw.setCursor(Qt.CursorShape.CrossCursor)
+        self.refresh_facets()
+        self.status_label.setText(
+            f"Facet “{label}” — Phase A: click interface points, then "
+            f"“Finish Interface”. Esc to pause clicking."
+        )
+
+    def set_active_facet_session(self, idx):
+        if not (0 <= idx < len(self.facet_sessions)):
+            return
+        self.active_facet_idx = idx
+        session = self.facet_sessions[idx]
+        if self.facet_mode is not None:
+            self.facet_mode = session.phase
+        self.refresh_facets()
+
+    def delete_facet_session(self, session):
+        graphics = self._facet_graphics.pop(id(session), None)
+        if graphics is not None:
+            graphics.remove()
+        if session in self.facet_sessions:
+            self.facet_sessions.remove(session)
+        self.active_facet_idx = min(self.active_facet_idx, len(self.facet_sessions) - 1)
+        if not self.facet_sessions:
+            self._exit_facet_mode()
+        self.refresh_facets()
+
+    def clear_all_facet_sessions(self):
+        for graphics in self._facet_graphics.values():
+            graphics.remove()
+        self._facet_graphics.clear()
+        self.facet_sessions.clear()
+        self.active_facet_idx = -1
+        self._exit_facet_mode()
+        if self.facet_panel.isVisible():
+            self.facet_panel.session_list.clear()
+            self.facet_panel.refresh()
+
+    def _exit_facet_mode(self):
+        if self.facet_mode is not None:
+            self.facet_mode = None
+            self.glw.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def _facet_start_or_resume(self):
+        """Ctrl+Shift+A: open the panel and resume clicking on the active session."""
+        if self.sequence_manager is None:
+            QMessageBox.warning(self, "No Sequence", "Open a TIFF sequence first.")
+            return
+        self.facet_panel.show()
+        self.facet_panel.raise_()
+        session = self.active_facet_session()
+        if session is None:
+            self.facet_panel._on_new_session()
+            return
+        self.facet_mode = session.phase
+        self.glw.setCursor(Qt.CursorShape.CrossCursor)
+        self.refresh_facets()
+
+    # -- rendering -------------------------------------------------------
+
+    def _facet_visible_sessions(self):
+        """Sessions that belong on the current frame and are toggled visible."""
+        return [s for s in self.facet_sessions
+                if s.visible and s.frame_idx == self.current_frame]
+
+    def refresh_facets(self):
+        """Redraw every facet overlay and refresh the panel."""
+        live_ids = set()
+        visible = self._facet_visible_sessions()
+        image_hw = self._display_hw
+
+        for session in self.facet_sessions:
+            key = id(session)
+            live_ids.add(key)
+            graphics = self._facet_graphics.get(key)
+            if graphics is None:
+                colour = FACET_COLORS[session.color_idx % len(FACET_COLORS)]
+                graphics = FacetGraphics(self.view_box, colour)
+                self._facet_graphics[key] = graphics
+            if session in visible:
+                graphics.set_visible(True)
+                graphics.update(session, image_hw)
+            else:
+                graphics.set_visible(False)
+
+        for key in [k for k in self._facet_graphics if k not in live_ids]:
+            self._facet_graphics.pop(key).remove()
+
+        if self.facet_panel.isVisible():
+            self.facet_panel.refresh()
+
+    # -- click / drag handling -------------------------------------------
+
+    def _facet_hit_test(self, img_pos):
+        """Nearest draggable facet point under the cursor, or None.
+
+        Returns (session, kind, index). The hit radius is defined in screen
+        pixels and converted to view units so it stays usable at any zoom.
+        """
+        try:
+            px_w, px_h = self.view_box.viewPixelSize()
+        except Exception:
+            px_w = px_h = 1.0
+        radius = 9.0 * max(px_w, px_h)
+        radius_sq = radius * radius
+
+        best = None
+        best_dist = radius_sq
+        x, y = img_pos.x(), img_pos.y()
+        for session in self._facet_visible_sessions():
+            for kind in ("surface", "interface"):
+                points = (session.surface_points if kind == "surface"
+                          else session.interface_points)
+                for i, (px, py) in enumerate(points):
+                    d = (px - x) ** 2 + (py - y) ** 2
+                    if d <= best_dist:
+                        best_dist = d
+                        best = (session, kind, i)
+        return best
+
+    def _facet_on_press(self, img_pos):
+        """Left-press in the image. True if the event was consumed."""
+        hit = self._facet_hit_test(img_pos)
+        if hit is not None:
+            self._facet_drag = hit
+            session, kind, i = hit
+            self.active_facet_idx = self.facet_sessions.index(session)
+            self.refresh_facets()
+            return True
+
+        if self.facet_mode is None:
+            return False
+
+        session = self.active_facet_session()
+        if session is None:
+            return False
+        if session.frame_idx != self.current_frame:
+            self.status_label.setText(
+                f"Session “{session.label}” belongs to frame {session.frame_idx + 1}. "
+                f"Scrub back to it, or start a new session on this frame."
+            )
+            return True
+
+        phase = session.add_point(img_pos.x(), img_pos.y())
+        self.refresh_facets()
+        if phase == "interface":
+            self.status_label.setText(
+                f"Interface points: {len(session.interface_points)}. "
+                f"Click “Finish Interface” when the line looks right."
+            )
+        else:
+            measurements = session.measurements()
+            if measurements:
+                last = measurements[-1]
+                value = session.to_units(last.thickness_px)
+                self.status_label.setText(
+                    f"Thickness #{len(measurements)}: {value:.4g} {session.unit} "
+                    f"at foot x = {session.to_units(last.foot_x):.4g} {session.unit}"
+                )
+        return True
+
+    def _facet_on_drag(self, img_pos):
+        if self._facet_drag is None:
+            return False
+        session, kind, i = self._facet_drag
+        session.move_point(kind, i, img_pos.x(), img_pos.y())
+        self.refresh_facets()
+        return True
+
+    def _facet_on_release(self):
+        if self._facet_drag is None:
+            return False
+        self._facet_drag = None
+        self.refresh_facets()
+        return True
+
+    # -- persistence ------------------------------------------------------
+
+    def save_facet_sessions_dialog(self):
+        if not self.facet_sessions:
+            QMessageBox.information(self, "Nothing to Save", "No facet sessions yet.")
+            return
+        start_dir = self.sequence_manager.folder_path if self.sequence_manager else ""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Facet Sessions", os.path.join(start_dir, "facet_sessions.json"),
+            "JSON (*.json)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(sessions_to_json(self.facet_sessions))
+        except OSError as e:
+            QMessageBox.critical(self, "Save Failed", str(e))
+            return
+        self.status_label.setText(
+            f"Saved {len(self.facet_sessions)} facet session(s) to {os.path.basename(path)}"
+        )
+
+    def load_facet_sessions_dialog(self):
+        start_dir = self.sequence_manager.folder_path if self.sequence_manager else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Facet Sessions", start_dir, "JSON (*.json)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                loaded = sessions_from_json(fh.read())
+        except (OSError, ValueError) as e:
+            QMessageBox.critical(self, "Load Failed", str(e))
+            return
+        self.clear_all_facet_sessions()
+        self.facet_sessions = loaded
+        self.active_facet_idx = 0 if loaded else -1
+        self.facet_panel.session_list.clear()
+        self.facet_panel.show()
+        self.refresh_facets()
+        self.status_label.setText(
+            f"Loaded {len(loaded)} facet session(s) from {os.path.basename(path)}"
+        )
+
+    def export_facet_csv_dialog(self):
+        if not any(s.measurements() for s in self.facet_sessions):
+            QMessageBox.information(
+                self, "Nothing to Export",
+                "No completed measurements yet — a session needs a fitted "
+                "interface and at least one surface point."
+            )
+            return
+        start_dir = self.sequence_manager.folder_path if self.sequence_manager else ""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Facet Measurements",
+            os.path.join(start_dir, "facet_thickness.csv"), "CSV (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            n = sessions_to_csv(path, self.facet_sessions)
+        except OSError as e:
+            QMessageBox.critical(self, "Export Failed", str(e))
+            return
+        self.status_label.setText(
+            f"Exported {n} facet session(s) to {os.path.basename(path)}"
+        )
+
+    # ------------------------------------------------------------------
     # Pixel scale / measurement
     # ------------------------------------------------------------------
 
@@ -3453,6 +4267,10 @@ class TiffViewerApp(QMainWindow):
             if self.tool_window.isVisible():
                 with self.perf.span("histogram"):
                     self.tool_window.update_histogram(self._last_frame_for_histogram)
+            if self.facet_sessions:
+                # Only sessions belonging to this frame stay drawn.
+                with self.perf.span("facet_overlay"):
+                    self.refresh_facets()
         finally:
             self.perf.end_frame()
             if self.perf_window.isVisible():
@@ -3566,6 +4384,7 @@ class TiffViewerApp(QMainWindow):
             self.num_frames = self.sequence_manager.num_frames
             self.current_frame = self.sequence_manager.get_index_from_filename(target_filename)
             self.clear_all_rays()
+            self.clear_all_facet_sessions()
             if self.measure_mode:
                 self._exit_measure_mode(committed_px=None)
             self._of_display_cache.clear()
@@ -3660,6 +4479,13 @@ class TiffViewerApp(QMainWindow):
                 self.status_label.setText(f"Frame: {self.current_frame + 1} / {self.num_frames}")
             return
 
+        if self.facet_mode is not None:
+            if event.key() == Qt.Key.Key_Escape:
+                self._exit_facet_mode()
+                self.refresh_facets()
+                self._refresh_status_label()
+                return
+
         if self.crop_mode:
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 self._confirm_crop()
@@ -3724,6 +4550,24 @@ class TiffViewerApp(QMainWindow):
                 self._place_ray(img_pos)
                 return True
             return False
+
+        # Facet points. Dragging an existing point works whenever the panel is
+        # open; placing a new one requires facet_mode. Events are consumed only
+        # when a point is actually hit or placed, so crop mode is untouched.
+        if self.facet_panel.isVisible() or self.facet_mode is not None:
+            if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                scene_pos = self.glw.mapToScene(event.pos())
+                img_pos = self.view_box.mapSceneToView(scene_pos)
+                if self._facet_on_press(img_pos):
+                    return True
+            elif etype == QEvent.Type.MouseMove and self._facet_drag is not None:
+                scene_pos = self.glw.mapToScene(event.pos())
+                img_pos = self.view_box.mapSceneToView(scene_pos)
+                if self._facet_on_drag(img_pos):
+                    return True
+            elif etype == QEvent.Type.MouseButtonRelease and self._facet_drag is not None:
+                if self._facet_on_release():
+                    return True
 
         if not self.crop_mode:
             return False
@@ -3864,6 +4708,7 @@ class TiffViewerApp(QMainWindow):
     def closeEvent(self, event):
         self.tool_window.close()
         self.pipeline_panel.close()
+        self.facet_panel.close()
         super().closeEvent(event)
 
 
