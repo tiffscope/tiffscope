@@ -31,7 +31,7 @@ tiffscope does one thing fast instead of everything slowly:
   - Region props (area, equivalent diameter, axes, eccentricity) with physical-unit conversion and CSV export
   - Live optical flow overlay (Farnebäck) for a qualitative look at motion before running full analysis
 - **Measurement** — pixel-to-physical scale calibration, horizontal/vertical measurement rays.
-- **Facet thickness** — measure thin-film coating thickness *perpendicular to a slanted substrate facet* (e.g. an ITO film on KOH-textured silicon). You click the points; the perpendicular geometry is computed exactly by orthogonal (total least squares) line fitting. Live table, live thickness-vs-position plot, JSON sessions and CSV export.
+- **Facet thickness** — measure thin-film coating thickness *perpendicular to a slanted substrate facet*. You click the points; the perpendicular geometry is computed exactly by orthogonal (total least squares) line fitting. Live table, live thickness-vs-position plot, JSON sessions and CSV export.
 - **Performance monitor** — per-operation timing of the live pipeline (`Ctrl+Shift+M`).
 
 ## Installation
