@@ -79,48 +79,6 @@ python main.py
 | `Ctrl+Shift+A` | Start / resume facet clicking |
 | `Ctrl+Shift+M` | Performance monitor |
 
-## Facet thickness measurement
-
-For SEM cross-sections where the substrate surface is inclined — a KOH-textured
-silicon sawtooth, for example, whose (111) facets sit at 54.74° — film thickness
-must be measured **perpendicular to the local facet**. Measuring vertically
-overestimates it by 1/cos θ: at 54.74° that is a 73% error.
-
-Segmentation is unreliable on these images, so you click the points and tiffscope
-does the geometry.
-
-1. `Ctrl+M` — set the pixel scale first (optional; without it everything is
-   reported in pixels and the panel says so).
-2. `Ctrl+Shift+P` — open the Facet Thickness panel, then **New Session** and name
-   it (e.g. `upleg`, `downleg`).
-3. **Phase A — the interface.** Click 10–15 points along the film/substrate
-   interface. A total-least-squares line is fitted live and extended across the
-   image. Its RMS residual is your clicking noise, and it is reported as the
-   honest error bar on the session.
-4. **Finish Interface** advances to phase B.
-5. **Phase B — the outer surface.** Click points along the film/vacuum surface.
-   Each one immediately gets a perpendicular dropped onto the fitted interface
-   line, labelled with the thickness in physical units. Thickness is reported
-   against the **x of the foot of the perpendicular**, not the clicked point —
-   the foot is the physically meaningful position along the substrate.
-6. Drag any point to nudge it; the fit, the perpendiculars, the table and the
-   plot all recompute live. **Undo Last Point** / **Delete Selected** for
-   corrections.
-7. **Save JSON…** stores the session with the scale and source frame in force at
-   measurement time. **Export CSV…** writes one row per measurement plus a
-   commented header carrying each session's summary.
-
-Multiple sessions coexist on screen in distinct colours with per-session
-visibility toggles, so upleg and downleg can be compared side by side in the
-thickness-vs-x plot.
-
-The panel shows the fitted facet angle and, as a soft hint only, notes whether it
-lands within 2° of the Si (111) angle. An off-nominal angle usually just means
-the cleave is tilted or off-centre — it never blocks measurement.
-
-Points on the minority side of the interface are flagged (`wrong side?`) rather
-than silently averaged in, which catches misclicks onto the substrate.
-
 ## Typical workflows
 
 **PIV/PTV preprocessing** — rotate → crop to ROI → background subtract → save cropped, cleaned frames or thresholded particle masks for your PIV software.
