@@ -5,3 +5,4 @@ tifffile
 opencv-python
 imagecodecs
 scikit-image
+scipy

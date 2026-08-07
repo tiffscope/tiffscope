@@ -29,6 +29,7 @@ tiffscope does one thing fast instead of everything slowly:
 - **Analysis tools**
   - Blob size histogram — pick size thresholds empirically from the actual data
   - Region props (area, equivalent diameter, axes, eccentricity) with physical-unit conversion and CSV export
+  - Mie particle sizing — invert a Mie scattering solution to get a particle-size distribution (D10/D50/D90) from laser-sheet-lit particle cross-sections
   - Live optical flow overlay (Farnebäck) for a qualitative look at motion before running full analysis
 - **Measurement** — pixel-to-physical scale calibration, horizontal/vertical measurement rays.
 - **Facet thickness** — measure thin-film coating thickness *perpendicular to a slanted substrate facet*. You click the points; the perpendicular geometry is computed exactly by orthogonal (total least squares) line fitting. Live table, live thickness-vs-position plot, JSON sessions and CSV export.
@@ -85,13 +86,15 @@ python main.py
 
 **Particle sizing** — adaptive threshold → morphology cleanup → intensity watershed to split touching particles → region props with physical units → CSV.
 
+**Mie particle sizing (laser-sheet scattering)** — set the scale, threshold the laser-sheet-lit particles, then Analysis → *Mie Particle Sizing*. Each blob's area (in m²) is taken as its scattering cross-section C_sca; a forward Mie curve is inverted per particle for the complex refractive index you supply, and the radii are fit with a Rosin-Rammler distribution reporting D10/D50/D90. Areas come from the live region-props path or an imported CSV.
+
 **Coating thickness on textured substrates** — set the scale, then click the interface and the outer surface on an SEM cross-section; get per-facet perpendicular thickness as a function of position, with the fit residual as the error bar.
 
 **Just looking** — open a folder, scrub, probe raw pixel values, drop measurement rays. Sometimes that's all you need.
 
 ## Architecture
 
-Five files, no packages: `image_engine.py` (I/O + pixel math), `operations.py` (processing ops), `pipeline.py` (ordering/caching/serialization), `measurement.py` (facet thickness geometry), `main.py` (PyQt6 + pyqtgraph GUI). Everything except `main.py` has zero GUI imports and is usable headless.
+Six files, no packages: `image_engine.py` (I/O + pixel math), `operations.py` (processing ops), `pipeline.py` (ordering/caching/serialization), `measurement.py` (facet thickness geometry), `mie.py` (Mie scattering + Rosin-Rammler sizing), `main.py` (PyQt6 + pyqtgraph GUI). Everything except `main.py` has zero GUI imports and is usable headless.
 
 ## Roadmap
 
@@ -101,6 +104,24 @@ Five files, no packages: `image_engine.py` (I/O + pixel math), `operations.py` (
 - Faster peak detection in intensity watershed (pure-OpenCV NMS, dropping the scikit-image dependency)
 
 Issues and PRs welcome.
+
+## Citation
+
+The Mie particle-sizing method (laser-sheet scattering cross-section → size distribution) is from:
+
+> S. Dasgupta, S. Raut, V. Vadukut, M. Bose, "Design and Development of a Pneumatic Atomizer for Seeding Tracers in PIV Experiments," *Journal of Flow Visualization and Image Processing*, 32(3), 2025.
+
+```bibtex
+@article{dasgupta2025design,
+  title={Design and Development of a Pneumatic Atomizer for Seeding Tracers in PIV Experiments},
+  author={Dasgupta, Souvik and Raut, Swapnil and Vadukut, Vinoy and Bose, Manaswita},
+  journal={Journal of Flow Visualization and Image Processing},
+  volume={32},
+  number={3},
+  year={2025},
+  publisher={Begel House Inc.}
+}
+```
 
 ## License
 

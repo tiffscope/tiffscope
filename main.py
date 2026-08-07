@@ -1049,6 +1049,484 @@ class RegionPropsWindow(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# MieAnalysisWindow — particle sizing from scattering cross-section
+# ---------------------------------------------------------------------------
+
+class MieComputeWorker(QThread):
+    """Runs mie.analyze() off the GUI thread. The forward Mie sweep is O(num_a ·
+    n_max) and can take tens of seconds for large particles / fine grids, so it
+    must never block the UI."""
+    finished = pyqtSignal(object)   # mie.MieResult
+    error = pyqtSignal(str)
+
+    def __init__(self, areas_m2, n_real, n_imag, a_start, a_stop,
+                 lam_nm, n_medium, mu, num_a):
+        super().__init__()
+        self._args = (areas_m2, n_real, n_imag, a_start, a_stop)
+        self._kw = dict(lam_nm=lam_nm, n_medium=n_medium, mu=mu, num_a=num_a)
+
+    def run(self):
+        try:
+            import mie
+            res = mie.analyze(*self._args, **self._kw)
+            self.finished.emit(res)
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{e}\n{traceback.format_exc()}")
+
+
+
+class MieAnalysisWindow(QWidget):
+    """Mie-scattering particle sizing.
+
+    Treats each measured blob area (in m²) as that particle's scattering
+    cross-section C_sca, inverts a forward Mie curve to per-particle radii, and
+    fits a Rosin-Rammler CDF for D10/D50/D90. See mie.py.
+
+    Method from:
+      Dasgupta, Raut, Vadukut, Bose, "Design and Development of a Pneumatic
+      Atomizer for Seeding Tracers in PIV Experiments", J. Flow Visualization
+      and Image Processing 32(3), 2025.
+
+    Areas come from either the in-memory Region Props path (px² → m² via the
+    Ctrl+M pixel scale) or a loaded CSV whose areas are already physical.
+    """
+
+    def __init__(self, main_app):
+        super().__init__()
+        self.main_app = main_app
+        self.setWindowTitle("Mie Particle Sizing")
+        self.setWindowFlags(Qt.WindowType.Tool)
+        self.resize(760, 680)
+        self._worker: RegionPropsWorker | None = None
+        self._mie_worker: MieComputeWorker | None = None
+        self._areas_m2: np.ndarray | None = None   # particle areas (== C_sca), m²
+        self._areas_source: str = ""               # human-readable provenance
+        self._result = None                         # mie.MieResult
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+
+        # --- Area source row ---
+        src_row = QHBoxLayout()
+        src_row.addWidget(QLabel("Areas from:"))
+        self.source_combo = QComboBox()
+        self.source_combo.addItems(["Region Props (in-memory)", "CSV file"])
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        src_row.addWidget(self.source_combo)
+        src_row.addSpacing(8)
+        self.spin_n = QSpinBox()
+        self.spin_n.setRange(1, 99999)
+        self.spin_n.setValue(200)
+        self.sample_lbl = QLabel("Sample frames:")
+        src_row.addWidget(self.sample_lbl)
+        src_row.addWidget(self.spin_n)
+        self.all_check = QCheckBox("All frames")
+        self.all_check.toggled.connect(lambda c: self.spin_n.setEnabled(not c))
+        src_row.addWidget(self.all_check)
+        self.load_csv_btn = QPushButton("Load CSV…")
+        self.load_csv_btn.setVisible(False)
+        self.load_csv_btn.clicked.connect(self._load_csv)
+        src_row.addWidget(self.load_csv_btn)
+        self.csv_unit_combo = QComboBox()
+        self.csv_unit_combo.addItems(["mm", "µm", "m", "cm", "nm"])
+        self.csv_unit_combo.setVisible(False)
+        self.csv_unit_lbl = QLabel("CSV area unit:")
+        self.csv_unit_lbl.setVisible(False)
+        src_row.addWidget(self.csv_unit_lbl)
+        src_row.addWidget(self.csv_unit_combo)
+        src_row.addStretch()
+        layout.addLayout(src_row)
+
+        # --- Optical parameters row ---
+        opt_row = QHBoxLayout()
+        opt_row.addWidget(QLabel("n (real):"))
+        self.n_real = QLineEdit("1.5")
+        self.n_real.setValidator(QDoubleValidator())
+        self.n_real.setMaximumWidth(70)
+        opt_row.addWidget(self.n_real)
+        opt_row.addWidget(QLabel("n (imag):"))
+        self.n_imag = QLineEdit("0.0")
+        self.n_imag.setValidator(QDoubleValidator())
+        self.n_imag.setMaximumWidth(70)
+        opt_row.addWidget(self.n_imag)
+        opt_row.addWidget(QLabel("λ (nm):"))
+        self.lam = QLineEdit("527")
+        self.lam.setValidator(QDoubleValidator(1.0, 1e5, 3))
+        self.lam.setMaximumWidth(70)
+        opt_row.addWidget(self.lam)
+        opt_row.addWidget(QLabel("n medium:"))
+        self.n_medium = QLineEdit("1.0")
+        self.n_medium.setValidator(QDoubleValidator(1e-3, 10.0, 4))
+        self.n_medium.setMaximumWidth(70)
+        opt_row.addWidget(self.n_medium)
+        opt_row.addWidget(QLabel("μ:"))
+        self.mu = QLineEdit("1.0")
+        self.mu.setValidator(QDoubleValidator())
+        self.mu.setMaximumWidth(60)
+        opt_row.addWidget(self.mu)
+        opt_row.addStretch()
+        layout.addLayout(opt_row)
+
+        # --- Radius sweep row ---
+        rad_row = QHBoxLayout()
+        rad_row.addWidget(QLabel("Radius start (m):"))
+        self.a_start = QLineEdit("")
+        self.a_start.setValidator(QDoubleValidator(0.0, 1.0, 12))
+        self.a_start.setMaximumWidth(110)
+        rad_row.addWidget(self.a_start)
+        rad_row.addWidget(QLabel("stop (m):"))
+        self.a_stop = QLineEdit("")
+        self.a_stop.setValidator(QDoubleValidator(0.0, 1.0, 12))
+        self.a_stop.setMaximumWidth(110)
+        rad_row.addWidget(self.a_stop)
+        self.auto_btn = QPushButton("Auto range")
+        self.auto_btn.setToolTip("Seed radius range from the measured areas (geometric estimate).")
+        self.auto_btn.clicked.connect(self._auto_range)
+        rad_row.addWidget(self.auto_btn)
+        rad_row.addSpacing(8)
+        rad_row.addWidget(QLabel("grid:"))
+        self.num_a = QLineEdit("50000")
+        self.num_a.setValidator(QIntValidator(100, 500000))
+        self.num_a.setMaximumWidth(70)
+        self.num_a.setToolTip(
+            "Radius sweep resolution. 50000 matches the original MATLAB (accurate "
+            "but slow); lower it to trade fidelity for speed."
+        )
+        rad_row.addWidget(self.num_a)
+        rad_row.addStretch()
+        self.run_btn = QPushButton("Run")
+        self.run_btn.clicked.connect(self._run)
+        rad_row.addWidget(self.run_btn)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.clicked.connect(self._cancel)
+        rad_row.addWidget(self.cancel_btn)
+        layout.addLayout(rad_row)
+
+        from PyQt6.QtWidgets import QProgressBar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        # --- Plots ---
+        self.csca_plot = pg.PlotWidget()
+        self.csca_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.csca_plot.setLabel('bottom', 'radius a (m)')
+        self.csca_plot.setLabel('left', 'C_sca (m²)')
+        self.csca_plot.setLogMode(x=True, y=True)
+        layout.addWidget(self.csca_plot, stretch=1)
+
+        self.cdf_plot = pg.PlotWidget()
+        self.cdf_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.cdf_plot.setLabel('bottom', 'radius a (m)')
+        self.cdf_plot.setLabel('left', 'cumulative fraction')
+        layout.addWidget(self.cdf_plot, stretch=1)
+
+        self.export_btn = QPushButton("Export radii CSV…")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self._export_csv)
+        layout.addWidget(self.export_btn)
+
+        self.stats_label = QLabel(
+            "Load areas and Run. Each blob area (m²) is treated as its scattering "
+            "cross-section C_sca. In-memory areas need a pixel scale (Ctrl+M)."
+        )
+        self.stats_label.setStyleSheet("font-family: monospace; font-size: 11px;")
+        self.stats_label.setWordWrap(True)
+        layout.addWidget(self.stats_label)
+
+        cite = QLabel(
+            "Method: Dasgupta et al., J. Flow Visualization and Image Processing "
+            "32(3), 2025."
+        )
+        cite.setStyleSheet("color: gray; font-size: 10px;")
+        cite.setWordWrap(True)
+        layout.addWidget(cite)
+
+        self._on_source_changed()
+
+    # ------------------------------------------------------------------
+
+    def _on_source_changed(self):
+        csv = self.source_combo.currentText() == "CSV file"
+        self.load_csv_btn.setVisible(csv)
+        self.csv_unit_combo.setVisible(csv)
+        self.csv_unit_lbl.setVisible(csv)
+        self.sample_lbl.setVisible(not csv)
+        self.spin_n.setVisible(not csv)
+        self.all_check.setVisible(not csv)
+
+    def _load_csv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load areas CSV", "", "CSV files (*.csv);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            areas = self._read_area_column(path)
+        except Exception as e:
+            QMessageBox.critical(self, "CSV Load Failed", str(e))
+            return
+        import mie
+        factor = mie.area_unit_to_m2_factor(self.csv_unit_combo.currentText())
+        self._areas_m2 = areas * factor
+        self._areas_source = f"{len(areas)} areas from {os.path.basename(path)} " \
+                             f"({self.csv_unit_combo.currentText()}²)"
+        self.stats_label.setText(f"Loaded {self._areas_source}. Set params and Run.")
+        self._auto_range()
+
+    @staticmethod
+    def _read_area_column(path: str) -> np.ndarray:
+        """Read an 'Area' column from a CSV. Case-insensitive header match; falls
+        back to the first numeric column if no 'area' header exists."""
+        import csv as _csv
+        with open(path, newline="") as f:
+            reader = _csv.reader(f)
+            rows = [r for r in reader if r]
+        if not rows:
+            raise ValueError("empty CSV")
+        header = [h.strip().lower() for h in rows[0]]
+        col = None
+        for i, h in enumerate(header):
+            if h == "area" or h.startswith("area"):
+                col = i
+                break
+        data_rows = rows[1:] if col is not None else rows
+        if col is None:
+            col = 0  # no header match — assume first column is area
+        vals = []
+        for r in data_rows:
+            if col >= len(r):
+                continue
+            try:
+                vals.append(float(r[col]))
+            except ValueError:
+                continue
+        if not vals:
+            raise ValueError("no numeric area values found")
+        return np.asarray(vals, dtype=float)
+
+    def _auto_range(self):
+        """Seed radius sweep from measured areas via geometric estimate a≈√(area/π)."""
+        if self._areas_m2 is None or self._areas_m2.size == 0:
+            return
+        a_geom = np.sqrt(np.clip(self._areas_m2, 0, None) / np.pi)
+        a_geom = a_geom[a_geom > 0]
+        if a_geom.size == 0:
+            return
+        # Geometric radius already slightly over-estimates the true radius (in the
+        # optics limit C_sca→2πa², so a≈√(area/2π) < √(area/π)); a modest bracket
+        # is enough and keeps the size parameter — hence n_max and runtime — small.
+        a_start = max(a_geom.min() * 0.5, 1e-10)
+        a_stop = a_geom.max() * 1.5
+        self.a_start.setText(f"{a_start:.4e}")
+        self.a_stop.setText(f"{a_stop:.4e}")
+
+    # --- in-memory area collection (reuses RegionPropsWorker) ----------
+
+    def _collect_inmemory(self):
+        app = self.main_app
+        if app.sequence_manager is None:
+            self.stats_label.setText("No sequence loaded.")
+            return False
+        if app.pipeline.scale is None:
+            self.stats_label.setText(
+                "No pixel scale set. Set one via Ctrl+M (Tools → Set Scale…) so "
+                "areas can be converted to m², or switch to a CSV source."
+            )
+            return False
+        thresh_idx, thresh_op = app._find_op(AdaptiveThresholdOp)
+        if thresh_op is None or not thresh_op.enabled:
+            self.stats_label.setText("No enabled AdaptiveThresholdOp in pipeline.")
+            return False
+
+        binary_ops = [
+            op for op in app.pipeline.operations[thresh_idx + 1:]
+            if op.enabled and getattr(op, 'is_binary_mask_op', False)
+        ]
+        n_frames = app.sequence_manager.num_frames
+        if self.all_check.isChecked():
+            sample_indices = list(range(n_frames))
+        else:
+            n = min(self.spin_n.value(), n_frames)
+            sample_indices = list(np.unique(
+                np.round(np.linspace(0, n_frames - 1, n)).astype(int)
+            ))
+
+        self._worker = RegionPropsWorker(
+            app.pipeline, app.sequence_manager, thresh_idx, sample_indices, binary_ops,
+        )
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_areas_ready)
+        self._worker.error.connect(self._on_error)
+        self.run_btn.setEnabled(False)
+        self.cancel_btn.setVisible(True)
+        self.progress_bar.setMaximum(len(sample_indices))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.stats_label.setText(f"Collecting areas from {len(sample_indices)} frames…")
+        self._worker.start()
+        return True
+
+    def _on_areas_ready(self, results: dict):
+        self._worker = None
+        self._set_idle()
+        areas_px2 = np.asarray(results.get('area', []), dtype=float)
+        if areas_px2.size == 0:
+            self.stats_label.setText("No blobs found in sampled frames.")
+            return
+        import mie
+        scale = self.main_app.pipeline.scale
+        unit_per_px = scale["value"] / scale["px"]
+        unit_factor = mie.area_unit_to_m2_factor(scale["unit"])
+        if unit_factor is None:
+            self.stats_label.setText(
+                f"Scale unit '{scale['unit']}' not recognised (need m/cm/mm/µm/nm)."
+            )
+            return
+        # px² → (scale unit)² → m²
+        self._areas_m2 = areas_px2 * (unit_per_px ** 2) * unit_factor
+        self._areas_source = f"{areas_px2.size} blobs (in-memory, scale {scale['unit']})"
+        if not self.a_start.text() or not self.a_stop.text():
+            self._auto_range()
+        self._compute()
+
+    # --- run orchestration ---------------------------------------------
+
+    def _run(self):
+        if self.source_combo.currentText() == "CSV file":
+            if self._areas_m2 is None:
+                self.stats_label.setText("Load a CSV first.")
+                return
+            self._compute()
+        else:
+            self._collect_inmemory()
+
+    def _compute(self):
+        if self._areas_m2 is None or self._areas_m2.size == 0:
+            self.stats_label.setText("No areas to analyse.")
+            return
+        try:
+            a_start = float(self.a_start.text())
+            a_stop = float(self.a_stop.text())
+            params = dict(
+                n_real=float(self.n_real.text()), n_imag=float(self.n_imag.text()),
+                lam_nm=float(self.lam.text()), n_medium=float(self.n_medium.text()),
+                mu=float(self.mu.text()), num_a=int(self.num_a.text()),
+            )
+        except ValueError as e:
+            self.stats_label.setText(f"Invalid parameter: {e}")
+            return
+
+        # Forward Mie is heavy — run it off the GUI thread.
+        self._mie_worker = MieComputeWorker(
+            self._areas_m2, params["n_real"], params["n_imag"], a_start, a_stop,
+            params["lam_nm"], params["n_medium"], params["mu"], params["num_a"],
+        )
+        self._mie_worker.finished.connect(self._on_mie_finished)
+        self._mie_worker.error.connect(self._on_error)
+        self.run_btn.setEnabled(False)
+        self.progress_bar.setRange(0, 0)   # indeterminate — compute isn't chunked
+        self.progress_bar.setVisible(True)
+        self.stats_label.setText(
+            f"Computing Mie inversion for {self._areas_m2.size} particles "
+            f"(grid {params['num_a']})…"
+        )
+        self._mie_worker.start()
+
+    def _on_mie_finished(self, res):
+        self._mie_worker = None
+        self.progress_bar.setRange(0, 100)
+        self._set_idle()
+        self._result = res
+        self.export_btn.setEnabled(True)
+        self._redraw()
+
+    def _cancel(self):
+        if self._worker is not None:
+            self._worker.cancel()
+            self._worker.wait()
+            self._worker = None
+        self._set_idle()
+        self.stats_label.setText("Cancelled.")
+
+    def _on_progress(self, done: int, total: int):
+        self.progress_bar.setValue(done)
+
+    def _on_error(self, msg: str):
+        self._worker = None
+        self._mie_worker = None
+        self.progress_bar.setRange(0, 100)
+        self._set_idle()
+        self.stats_label.setText(f"Error: {msg}")
+
+    def _set_idle(self):
+        self.run_btn.setEnabled(True)
+        self.cancel_btn.setVisible(False)
+        self.progress_bar.setVisible(False)
+
+    def _redraw(self):
+        res = self._result
+        if res is None:
+            return
+        self.csca_plot.clear()
+        self.csca_plot.plot(res.a, res.csca, pen=pg.mkPen((0, 114, 189), width=2))
+
+        self.cdf_plot.clear()
+        self.cdf_plot.plot(
+            res.cdf_bin_centers, res.cdf_values,
+            pen=None, symbol='o', symbolSize=4,
+            symbolBrush=(150, 150, 150), name='empirical',
+        )
+        a = res.a
+        rr = 1.0 - np.exp(-((a / res.rr_b) ** res.rr_c))
+        self.cdf_plot.plot(a, rr, pen=pg.mkPen((217, 83, 25), width=2), name='Rosin-Rammler')
+        for d, col in ((res.D10, (0, 0, 255)), (res.D50, (0, 160, 0)), (res.D90, (255, 0, 0))):
+            self.cdf_plot.addItem(pg.InfiniteLine(pos=d, angle=90, pen=pg.mkPen(col, style=Qt.PenStyle.DashLine)))
+
+        def um(v):
+            return f"{v * 1e6:.3g}"
+        stats = (
+            f"{self._areas_source}   |   n = {complex(float(self.n_real.text()), float(self.n_imag.text()))}\n"
+            f"D10 = {res.D10:.3e} m ({um(res.D10)} µm)   |   "
+            f"D50 = {res.D50:.3e} m ({um(res.D50)} µm)   |   "
+            f"D90 = {res.D90:.3e} m ({um(res.D90)} µm)\n"
+            f"Rosin-Rammler:  b = {res.rr_b:.3e}   c = {res.rr_c:.3g}   R² = {res.r2:.4f}   "
+            f"(n particles = {res.radii.size})"
+        )
+        self.stats_label.setText(stats)
+
+    def _export_csv(self):
+        res = self._result
+        if res is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export radii CSV", "", "CSV files (*.csv)"
+        )
+        if not path:
+            return
+        lines = [
+            f"# Mie particle sizing — Dasgupta et al., J. Flow Vis. Image Proc. 32(3), 2025",
+            f"# n_sphere={res.n_sphere}, lambda_nm={res.lam_nm}, n_medium={res.n_medium}, mu={res.mu}",
+            f"# D10_m={res.D10:.6e}, D50_m={res.D50:.6e}, D90_m={res.D90:.6e}, "
+            f"RR_b={res.rr_b:.6e}, RR_c={res.rr_c:.6e}, R2={res.r2:.6f}",
+            "particle_idx,area_m2,radius_m,radius_um",
+        ]
+        for i, (area, r) in enumerate(zip(self._areas_m2, res.radii)):
+            lines.append(f"{i},{area:.6e},{r:.6e},{r * 1e6:.6g}")
+        try:
+            with open(path, 'w') as f:
+                f.write("\n".join(lines))
+            self.stats_label.setText(
+                self.stats_label.text() + f"\nExported {res.radii.size} radii → {path}"
+            )
+        except OSError as e:
+            QMessageBox.critical(self, "Export Failed", str(e))
+
+
+# ---------------------------------------------------------------------------
 # ContrastToolWindow (unchanged)
 # ---------------------------------------------------------------------------
 
@@ -2416,6 +2894,7 @@ class TiffViewerApp(QMainWindow):
         self.perf_window = PerformanceToolWindow(self)
         self.blob_size_window = BlobSizeAnalysisWindow(self)
         self.region_props_window = RegionPropsWindow(self)
+        self.mie_window = MieAnalysisWindow(self)
         self.facet_panel = FacetThicknessPanel(self)
 
         self.create_menus()
@@ -2799,6 +3278,14 @@ class TiffViewerApp(QMainWindow):
         )
         region_props_action.triggered.connect(self._show_region_props_window)
         analysis_menu.addAction(region_props_action)
+
+        mie_action = QAction("Mie Particle Sizing…", self)
+        mie_action.setToolTip(
+            "Size particles by treating each blob area (m²) as its Mie scattering\n"
+            "cross-section, then fitting a Rosin-Rammler distribution (D10/D50/D90)."
+        )
+        mie_action.triggered.connect(self._show_mie_window)
+        analysis_menu.addAction(mie_action)
 
         filters_menu = menu_bar.addMenu("Filters")
 
@@ -4323,6 +4810,10 @@ class TiffViewerApp(QMainWindow):
     def _show_region_props_window(self):
         self.region_props_window.show()
         self.region_props_window.raise_()
+
+    def _show_mie_window(self):
+        self.mie_window.show()
+        self.mie_window.raise_()
 
     def toggle_tool_window(self):
         if self.tool_window.isVisible():
