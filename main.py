@@ -1060,10 +1060,11 @@ class MieComputeWorker(QThread):
     error = pyqtSignal(str)
 
     def __init__(self, areas_m2, n_real, n_imag, a_start, a_stop,
-                 lam_nm, n_medium, mu, num_a):
+                 lam_nm, n_medium, mu, num_a, inversion):
         super().__init__()
         self._args = (areas_m2, n_real, n_imag, a_start, a_stop)
-        self._kw = dict(lam_nm=lam_nm, n_medium=n_medium, mu=mu, num_a=num_a)
+        self._kw = dict(lam_nm=lam_nm, n_medium=n_medium, mu=mu, num_a=num_a,
+                        inversion=inversion)
 
     def run(self):
         try:
@@ -1166,6 +1167,17 @@ class MieAnalysisWindow(QWidget):
         self.mu.setValidator(QDoubleValidator())
         self.mu.setMaximumWidth(60)
         opt_row.addWidget(self.mu)
+        opt_row.addSpacing(8)
+        opt_row.addWidget(QLabel("inversion:"))
+        self.inversion_combo = QComboBox()
+        self.inversion_combo.addItem("Smoothed trend", "trend")
+        self.inversion_combo.addItem("Legacy (MATLAB unique)", "legacy")
+        self.inversion_combo.setToolTip(
+            "Smoothed trend: grid-stable, inverts the monotone mean of C_sca(a).\n"
+            "Legacy: original MATLAB unique() — grid-sensitive in the ripple regime,\n"
+            "kept only to reproduce prior runs."
+        )
+        opt_row.addWidget(self.inversion_combo)
         opt_row.addStretch()
         layout.addLayout(opt_row)
 
@@ -1424,6 +1436,7 @@ class MieAnalysisWindow(QWidget):
         self._mie_worker = MieComputeWorker(
             self._areas_m2, params["n_real"], params["n_imag"], a_start, a_stop,
             params["lam_nm"], params["n_medium"], params["mu"], params["num_a"],
+            self.inversion_combo.currentData(),
         )
         self._mie_worker.finished.connect(self._on_mie_finished)
         self._mie_worker.error.connect(self._on_error)

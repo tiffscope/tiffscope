@@ -20,6 +20,7 @@ import numpy as np
 from scipy.special import jv, yv
 from scipy.optimize import curve_fit
 from scipy.interpolate import interp1d
+from scipy.ndimage import uniform_filter1d
 
 
 # --- physical-unit handling ------------------------------------------------
@@ -116,14 +117,48 @@ def csca_curve(a: np.ndarray, lam_nm: float, n_medium: float,
     return csca
 
 
-def invert_areas(areas_m2: np.ndarray, a: np.ndarray, csca: np.ndarray) -> np.ndarray:
+def _monotone_trend(a: np.ndarray, csca: np.ndarray, ripple_da: float,
+                    ripple_periods: float = 4.0) -> np.ndarray:
+    """Smooth C_sca(a) to its monotone-increasing mean trend.
+
+    C_sca(a) oscillates (Mie ripples) about a monotone trend, spacing Δa≈ripple_da
+    in radius. Averaging over a few ripple periods removes the ripples; the window
+    is defined in radius so it scales with grid density and the result is
+    grid-independent. `maximum.accumulate` then guarantees strict monotonicity so
+    the inversion is single-valued.
+    """
+    da = (a[-1] - a[0]) / (len(a) - 1)
+    window = max(int(round(ripple_periods * ripple_da / da)), 1)
+    # If the whole sweep spans less than one smoothing window, the range is
+    # sub-ripple (e.g. Rayleigh regime) — no ripples to average, and smoothing
+    # would flatten the curve to a constant. Only smooth when there is ripple
+    # structure to remove; either way enforce monotonicity for the inversion.
+    if window < len(csca):
+        csca = uniform_filter1d(csca, size=window, mode="nearest")
+    return np.maximum.accumulate(csca)
+
+
+def invert_areas(areas_m2: np.ndarray, a: np.ndarray, csca: np.ndarray,
+                 method: str = "trend", ripple_da: float | None = None) -> np.ndarray:
     """Invert measured cross-sections (== areas in m²) to radii via the C_sca curve.
 
-    Linear interpolation with extrapolation, on the sorted-unique C_sca values —
-    exactly MATLAB `interp1(unique(Csca), a, areas, 'linear', 'extrap')`. Note the
-    inversion is only well-posed where C_sca(a) is monotonic; in the Mie-ripple
-    regime unique() keeps the first occurrence and the mapping is approximate.
+    method='trend' (default): invert the smooth monotone trend of C_sca(a). The
+    raw curve is non-monotonic in the Mie-ripple regime, where a cross-section maps
+    to several radii; inverting the trend gives the unbiased, **grid-independent**
+    mean-trend radius. Requires `ripple_da` (≈ λ / (2·n_medium)).
+
+    method='legacy': the original MATLAB `interp1(unique(Csca), a, ...)`. Sorting by
+    C_sca scrambles the a-order into a zigzag whose surviving points depend on the
+    grid, so results are grid-sensitive. Kept only to reproduce prior MATLAB runs.
     """
+    csca = np.asarray(csca, dtype=float)
+    if method == "trend":
+        if ripple_da is None:
+            raise ValueError("method='trend' requires ripple_da")
+        csca = _monotone_trend(np.asarray(a, dtype=float), csca, ripple_da)
+    elif method != "legacy":
+        raise ValueError(f"unknown inversion method: {method!r}")
+
     csca_u, idx = np.unique(csca, return_index=True)   # sorted ascending, unique
     a_u = np.asarray(a)[idx]
     f = interp1d(csca_u, a_u, kind="linear", fill_value="extrapolate", bounds_error=False)
@@ -196,10 +231,13 @@ def rosin_rammler_fit(radii: np.ndarray, num_bins: int = 50):
 def analyze(areas_m2: np.ndarray, n_real: float, n_imag: float,
             a_start: float, a_stop: float, *, lam_nm: float = 527.0,
             n_medium: float = 1.0, mu: float = 1.0,
-            num_a: int = 50000, num_bins: int = 50) -> MieResult:
+            num_a: int = 50000, num_bins: int = 50,
+            inversion: str = "trend") -> MieResult:
     """End-to-end: areas (m²) -> radii -> Rosin-Rammler -> D10/D50/D90.
 
     Mirrors SubmitData.m defaults (527 nm, air, mu=1, 50000-point radius sweep).
+    `inversion` selects the area->radius map: 'trend' (default, grid-stable) or
+    'legacy' (original MATLAB unique(); grid-sensitive). See invert_areas.
     """
     if a_stop <= a_start:
         raise ValueError("a_stop must be greater than a_start")
@@ -210,7 +248,8 @@ def analyze(areas_m2: np.ndarray, n_real: float, n_imag: float,
     n_sphere = complex(n_real, n_imag)
     a = np.linspace(a_start, a_stop, num_a)
     csca = csca_curve(a, lam_nm, n_medium, n_sphere, mu)
-    radii = invert_areas(areas_m2, a, csca)
+    ripple_da = lam_nm * 1e-9 / (2.0 * n_medium)   # Δa per Mie ripple
+    radii = invert_areas(areas_m2, a, csca, method=inversion, ripple_da=ripple_da)
     b, c, r2, d10, d50, d90, centers, cdf = rosin_rammler_fit(radii, num_bins)
 
     return MieResult(
