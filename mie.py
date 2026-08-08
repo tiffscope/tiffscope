@@ -100,16 +100,21 @@ def csca_curve(a: np.ndarray, lam_nm: float, n_medium: float,
 
     csca = np.zeros_like(a, dtype=float)
     pref = 2.0 * np.pi / (k * k)
-    # The Bessel recurrence produces NaN/inf at the near-zero grid edge and can
-    # overflow at high order; those points are repaired by the fillmissing guard
-    # below, so silence the expected warnings rather than spam the console.
+    # n_max is set by the *largest* radius. At small-radius grid points those
+    # high orders (n >> x) are physically negligible, but the Bessel functions
+    # of order n+1/2 overflow there (yv -> ±inf, giving inf-inf = NaN in the
+    # coefficients), which would poison the whole point. Add only the finite
+    # per-term contributions and drop the non-finite ones (their true magnitude
+    # is ~0). Without this, a larger a_stop silently corrupts C_sca at small a
+    # into a flat floor hundreds of times too high — see the fixed regression.
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         for n in range(1, n_max + 1):
             an, bn = _mie_coeff(n, x, z, mu, m)
-            csca += pref * (2 * n + 1) * (np.abs(an) ** 2 + np.abs(bn) ** 2)
+            term = pref * (2 * n + 1) * (np.abs(an) ** 2 + np.abs(bn) ** 2)
+            np.add(csca, term, out=csca, where=np.isfinite(term))
 
-    # MATLAB fillmissing(..., 'linear', 'extrap'): guard against NaN from the
-    # Bessel recurrence at isolated grid points.
+    # Guard against any residual NaN (e.g. the near-zero grid edge). MATLAB used
+    # fillmissing(..., 'linear', 'extrap') here.
     if np.any(~np.isfinite(csca)):
         good = np.isfinite(csca)
         if good.sum() >= 2:
@@ -159,10 +164,16 @@ def invert_areas(areas_m2: np.ndarray, a: np.ndarray, csca: np.ndarray,
     elif method != "legacy":
         raise ValueError(f"unknown inversion method: {method!r}")
 
+    a = np.asarray(a, dtype=float)
     csca_u, idx = np.unique(csca, return_index=True)   # sorted ascending, unique
-    a_u = np.asarray(a)[idx]
+    a_u = a[idx]
     f = interp1d(csca_u, a_u, kind="linear", fill_value="extrapolate", bounds_error=False)
-    return f(np.asarray(areas_m2, dtype=float))
+    radii = f(np.asarray(areas_m2, dtype=float))
+    # Clamp to the physical sweep range. Cross-sections outside [csca.min, csca.max]
+    # would otherwise linear-extrapolate off the ends — below the curve minimum this
+    # produces *negative* (unphysical) radii. A radius pinned at a[0]/a[-1] signals
+    # the sweep range does not cover the data (widen it / re-Auto-range).
+    return np.clip(radii, a.min(), a.max())
 
 
 def _rosin_rammler(x, b, c):
