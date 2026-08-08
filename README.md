@@ -99,7 +99,6 @@ Six files, no packages: `image_engine.py` (I/O + pixel math), `operations.py` (p
 ## Roadmap
 
 - Variable pre-cache size and smarter buffering
-- Rolling-ball background subtraction
 - Scale-image overlay for calibration embedding
 - Faster peak detection in intensity watershed (pure-OpenCV NMS, dropping the scikit-image dependency)
 

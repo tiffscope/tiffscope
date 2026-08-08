@@ -19,7 +19,7 @@ from PyQt6.QtGui import QShortcut, QKeySequence, QAction, QActionGroup, QColor, 
 
 from image_engine import LazyTiffSequence, scale_16bit_to_8bit, build_display_lut
 from operations import (
-    Operation, RotateOp, CropOp, BgSubtractOp, AdaptiveThresholdOp,
+    Operation, RotateOp, CropOp, BgSubtractOp, RollingBallBgOp, AdaptiveThresholdOp,
     CLAHEOp, GaussianBlurOp, SharpenOp, LowPassOp, HighPassOp,
     MorphologyOp, BinarySmoothOp, WatershedSplitOp, IntensityWatershedSplitOp,
     OPERATION_REGISTRY,
@@ -3324,6 +3324,10 @@ class TiffViewerApp(QMainWindow):
         self.highpass_action.triggered.connect(lambda checked: self._toggle_filter(HighPassOp, self.highpass_action, checked))
         filters_menu.addAction(self.highpass_action)
 
+        self.rollingball_action = QAction("Rolling Ball BG (per-frame)", self, checkable=True)
+        self.rollingball_action.triggered.connect(lambda checked: self._toggle_filter(RollingBallBgOp, self.rollingball_action, checked))
+        filters_menu.addAction(self.rollingball_action)
+
         tools_menu = menu_bar.addMenu("Tools")
         scale_action = QAction("Set Scale…", self)
         scale_action.setShortcut("Ctrl+M")
@@ -3550,6 +3554,7 @@ class TiffViewerApp(QMainWindow):
             (SharpenOp, self.sharpen_action),
             (LowPassOp, self.lowpass_action),
             (HighPassOp, self.highpass_action),
+            (RollingBallBgOp, self.rollingball_action),
             (MorphologyOp, self.morphology_action),
             (BinarySmoothOp, self.binary_smooth_action),
             (WatershedSplitOp, self.watershed_action),

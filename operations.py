@@ -270,6 +270,77 @@ class AdaptiveThresholdOp(Operation):
 # Preprocessing ops
 # ---------------------------------------------------------------------------
 
+class RollingBallBgOp(Operation):
+    """Per-frame *spatial* background subtraction (ImageJ-style rolling ball).
+
+    Unlike BgSubtractOp, this estimates the background from each frame on its
+    own — no temporal sampling. Use it when the sequence is too short for a
+    clean temporal median/mean (e.g. 5 frames), where the temporal estimate
+    leaves ghost artifacts of the moving particles.
+
+    Two methods:
+      - ``opening`` (default): grayscale morphological opening with a ball-sized
+        ellipse kernel — the classic fast rolling-ball approximation. cv2 only,
+        fast enough for live scrubbing.
+      - ``rolling_ball``: scikit-image's true rolling-ball surface. More faithful
+        to a curved ball but O(seconds) on large frames — use for a few frames.
+
+    Optional pre-smooth (``smooth`` kernel, odd, 1=off): the background surface
+    is estimated on a Gaussian-smoothed copy, then subtracted from the *original*
+    frame. Mirrors ImageJ — stops per-pixel noise from poking through the ball.
+
+    Assumes bright features on a dark background (standard PIV/PTV). Dtype-preserving.
+    """
+
+    name = "RollingBallBgOp"
+    params_schema = [
+        {"key": "method", "type": "str", "default": "opening",
+         "choices": ["opening", "rolling_ball"], "label": "Method", "widget": "combo"},
+        {"key": "radius", "type": "int", "default": 50, "range": [1, 500],
+         "label": "Ball radius (px)", "widget": "spinbox"},
+        {"key": "smooth", "type": "int", "default": 1, "range": [1, 51],
+         "label": "Pre-smooth kernel (1=off)", "widget": "spinbox", "step": 2},
+    ]
+
+    def apply(self, frame: np.ndarray, context=None) -> np.ndarray:
+        radius = max(1, int(self.params["radius"]))
+        method = self.params["method"]
+        smooth = int(self.params["smooth"])
+
+        src = np.ascontiguousarray(frame)
+        work = src.astype(np.float32)
+
+        # Estimate the background surface on a smoothed copy (ImageJ behaviour):
+        # noise on the raw image would let single hot pixels poke through the ball.
+        est = work
+        if smooth > 1:
+            k = smooth if smooth % 2 == 1 else smooth + 1
+            est = cv2.GaussianBlur(work, (k, k), 0)
+
+        if method == "rolling_ball":
+            try:
+                from skimage.restoration import rolling_ball
+            except ImportError:
+                # scikit-image missing — fall back to the opening approximation.
+                method = "opening"
+            else:
+                bg = rolling_ball(est, radius=radius).astype(np.float32)
+
+        if method == "opening":
+            k = 2 * radius + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            bg = cv2.morphologyEx(est, cv2.MORPH_OPEN, kernel)
+
+        out = work - bg
+        np.clip(out, 0, None, out=out)
+
+        if frame.dtype == np.uint8:
+            return np.clip(out, 0, 255).astype(np.uint8)
+        if frame.dtype == np.uint16:
+            return np.clip(out, 0, 65535).astype(np.uint16)
+        return out.astype(frame.dtype)
+
+
 class CLAHEOp(Operation):
     name = "CLAHEOp"
     params_schema = [
@@ -736,7 +807,7 @@ class IntensityWatershedSplitOp(Operation):
 
 OPERATION_REGISTRY: dict[str, type[Operation]] = {
     cls.name: cls
-    for cls in [RotateOp, CropOp, BgSubtractOp, AdaptiveThresholdOp,
+    for cls in [RotateOp, CropOp, BgSubtractOp, RollingBallBgOp, AdaptiveThresholdOp,
                 CLAHEOp, GaussianBlurOp, SharpenOp, LowPassOp, HighPassOp,
                 MorphologyOp, BinarySmoothOp, WatershedSplitOp,
                 IntensityWatershedSplitOp]
