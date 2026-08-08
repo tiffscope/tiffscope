@@ -1493,21 +1493,30 @@ class MieAnalysisWindow(QWidget):
             pen=None, symbol='o', symbolSize=4,
             symbolBrush=(150, 150, 150), name='empirical',
         )
-        a = res.a
-        rr = 1.0 - np.exp(-((a / res.rr_b) ** res.rr_c))
-        self.cdf_plot.plot(a, rr, pen=pg.mkPen((217, 83, 25), width=2), name='Rosin-Rammler')
+        # Rosin-Rammler curve only when the fit converged (NaN params otherwise).
+        if res.rr_ok and np.isfinite(res.rr_b) and np.isfinite(res.rr_c):
+            a = res.a
+            rr = 1.0 - np.exp(-((a / res.rr_b) ** res.rr_c))
+            self.cdf_plot.plot(a, rr, pen=pg.mkPen((217, 83, 25), width=2), name='Rosin-Rammler')
         for d, col in ((res.D10, (0, 0, 255)), (res.D50, (0, 160, 0)), (res.D90, (255, 0, 0))):
-            self.cdf_plot.addItem(pg.InfiniteLine(pos=d, angle=90, pen=pg.mkPen(col, style=Qt.PenStyle.DashLine)))
+            if np.isfinite(d):
+                self.cdf_plot.addItem(pg.InfiniteLine(pos=d, angle=90, pen=pg.mkPen(col, style=Qt.PenStyle.DashLine)))
 
         def um(v):
             return f"{v * 1e6:.3g}"
+        source = "Rosin-Rammler fit" if res.rr_ok else "empirical percentiles"
+        rr_line = (
+            f"Rosin-Rammler:  b = {res.rr_b:.3e}   c = {res.rr_c:.3g}   R² = {res.r2:.4f}"
+            if res.rr_ok else
+            f"Rosin-Rammler fit failed (n = {res.radii.size} too small / distribution too coarse) — "
+            f"showing empirical percentiles instead"
+        )
         stats = (
             f"{self._areas_source}   |   n = {complex(float(self.n_real.text()), float(self.n_imag.text()))}\n"
             f"D10 = {res.D10:.3e} m ({um(res.D10)} µm)   |   "
             f"D50 = {res.D50:.3e} m ({um(res.D50)} µm)   |   "
-            f"D90 = {res.D90:.3e} m ({um(res.D90)} µm)\n"
-            f"Rosin-Rammler:  b = {res.rr_b:.3e}   c = {res.rr_c:.3g}   R² = {res.r2:.4f}   "
-            f"(n particles = {res.radii.size})"
+            f"D90 = {res.D90:.3e} m ({um(res.D90)} µm)   [{source}]\n"
+            f"{rr_line}   (n particles = {res.radii.size})"
         )
         self.stats_label.setText(stats)
 
@@ -1524,7 +1533,9 @@ class MieAnalysisWindow(QWidget):
             f"# Mie particle sizing — Dasgupta et al., J. Flow Vis. Image Proc. 32(3), 2025",
             f"# n_sphere={res.n_sphere}, lambda_nm={res.lam_nm}, n_medium={res.n_medium}, mu={res.mu}",
             f"# D10_m={res.D10:.6e}, D50_m={res.D50:.6e}, D90_m={res.D90:.6e}, "
-            f"RR_b={res.rr_b:.6e}, RR_c={res.rr_c:.6e}, R2={res.r2:.6f}",
+            f"source={'rosin_rammler' if res.rr_ok else 'empirical_percentiles'}",
+            f"# emp_D10_m={res.emp_D10:.6e}, emp_D50_m={res.emp_D50:.6e}, emp_D90_m={res.emp_D90:.6e}",
+            f"# RR_b={res.rr_b:.6e}, RR_c={res.rr_c:.6e}, R2={res.r2:.6f}, RR_ok={res.rr_ok}",
             "particle_idx,area_m2,radius_m,radius_um",
         ]
         for i, (area, r) in enumerate(zip(self._areas_m2, res.radii)):

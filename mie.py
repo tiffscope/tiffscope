@@ -166,7 +166,13 @@ def invert_areas(areas_m2: np.ndarray, a: np.ndarray, csca: np.ndarray,
 
 
 def _rosin_rammler(x, b, c):
-    return 1.0 - np.exp(-((x / b) ** c))
+    # Clip the exponent: (x/b)**c overflows float64 for large c or tiny b during
+    # curve_fit's search, producing inf -> NaN residuals that abort the fit.
+    # exp(-700) is already 0 to machine precision, so clipping changes nothing.
+    x = np.asarray(x, dtype=float)
+    with np.errstate(over="ignore", invalid="ignore"):
+        z = np.clip((x / b) ** c, 0.0, 700.0)
+        return 1.0 - np.exp(-z)
 
 
 @dataclass
@@ -186,9 +192,16 @@ class MieResult:
     rr_b: float
     rr_c: float
     r2: float
+    # D-values: RR-fit when the fit converged, else empirical percentiles (below).
     D10: float
     D50: float
     D90: float
+    # Empirical percentile D-values — always finite for n >= 1. Distribution-free,
+    # so they stay meaningful when the sample is too small for a Rosin-Rammler fit.
+    emp_D10: float = float("nan")
+    emp_D50: float = float("nan")
+    emp_D90: float = float("nan")
+    rr_ok: bool = True   # False when the RR fit failed and D-values are empirical
     cdf_bin_centers: np.ndarray = field(default_factory=lambda: np.array([]))
     cdf_values: np.ndarray = field(default_factory=lambda: np.array([]))
 
@@ -210,19 +223,29 @@ def rosin_rammler_fit(radii: np.ndarray, num_bins: int = 50):
     centers = np.concatenate([[0.0], centers])
     cdf = np.concatenate([[0.0], cdf])
 
-    p0 = [max(np.mean(centers), 1e-30), 1.0]
-    popt, _ = curve_fit(_rosin_rammler, centers, cdf, p0=p0,
-                        bounds=([0.0, 0.0], [np.inf, np.inf]), maxfev=20000)
-    b, c = float(popt[0]), float(popt[1])
-
-    # R² of the fit on the binned CDF.
-    resid = cdf - _rosin_rammler(centers, b, c)
-    ss_res = float(np.sum(resid ** 2))
-    ss_tot = float(np.sum((cdf - np.mean(cdf)) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    # Seed b at the median radius (robust scale estimate) rather than the mean of
+    # the bin centres — the latter is pulled toward empty high-radius bins for
+    # small samples and gives curve_fit a poor start.
+    med = float(np.median(radii)) if radii.size else 0.0
+    p0 = [max(med, 1e-30), 1.0]
+    try:
+        popt, _ = curve_fit(_rosin_rammler, centers, cdf, p0=p0,
+                            bounds=([0.0, 0.0], [np.inf, np.inf]), maxfev=20000)
+        b, c = float(popt[0]), float(popt[1])
+        resid = cdf - _rosin_rammler(centers, b, c)
+        ss_res = float(np.sum(resid ** 2))
+        ss_tot = float(np.sum((cdf - np.mean(cdf)) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    except (RuntimeError, ValueError, TypeError):
+        # Fit did not converge (common when too few particles give a coarse,
+        # jumpy CDF). Signal failure with NaNs; the caller falls back to
+        # empirical percentiles so the user still gets D-values.
+        b = c = r2 = float("nan")
 
     # Invert the analytic RR CDF for D-values: D_p = b * (-ln(1-p))^(1/c).
     def d_of(p):
+        if not (np.isfinite(b) and np.isfinite(c) and b > 0 and c > 0):
+            return float("nan")
         return b * (-np.log(1.0 - p)) ** (1.0 / c)
 
     return b, c, r2, float(d_of(0.10)), float(d_of(0.50)), float(d_of(0.90)), centers, cdf
@@ -252,9 +275,23 @@ def analyze(areas_m2: np.ndarray, n_real: float, n_imag: float,
     radii = invert_areas(areas_m2, a, csca, method=inversion, ripple_da=ripple_da)
     b, c, r2, d10, d50, d90, centers, cdf = rosin_rammler_fit(radii, num_bins)
 
+    # Empirical percentile D-values — distribution-free, always finite for n >= 1.
+    # For small samples that defeat the RR fit these are the usable result.
+    rf = radii[np.isfinite(radii) & (radii > 0)]
+    if rf.size:
+        e10, e50, e90 = (float(np.percentile(rf, p)) for p in (10, 50, 90))
+    else:
+        e10 = e50 = e90 = float("nan")
+
+    # Report the RR-fit D-values when the fit converged; otherwise fall back to
+    # the empirical percentiles so the user always gets something meaningful.
+    rr_ok = np.isfinite(d50)
+    D10, D50, D90 = (d10, d50, d90) if rr_ok else (e10, e50, e90)
+
     return MieResult(
         lam_nm=lam_nm, n_medium=n_medium, n_sphere=n_sphere, mu=mu,
         a_start=a_start, a_stop=a_stop, a=a, csca=csca, radii=radii,
-        rr_b=b, rr_c=c, r2=r2, D10=d10, D50=d50, D90=d90,
+        rr_b=b, rr_c=c, r2=r2, D10=D10, D50=D50, D90=D90,
+        emp_D10=e10, emp_D50=e50, emp_D90=e90, rr_ok=bool(rr_ok),
         cdf_bin_centers=centers, cdf_values=cdf,
     )
