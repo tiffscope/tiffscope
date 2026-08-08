@@ -280,14 +280,19 @@ class RollingBallBgOp(Operation):
 
     Two methods:
       - ``opening`` (default): grayscale morphological opening with a ball-sized
-        ellipse kernel — the classic fast rolling-ball approximation. cv2 only,
-        fast enough for live scrubbing.
+        ellipse kernel — the classic fast rolling-ball approximation.
       - ``rolling_ball``: scikit-image's true rolling-ball surface. More faithful
-        to a curved ball but O(seconds) on large frames — use for a few frames.
+        to a curved ball; falls back to ``opening`` if scikit-image is missing.
 
-    Optional pre-smooth (``smooth`` kernel, odd, 1=off): the background surface
-    is estimated on a Gaussian-smoothed copy, then subtracted from the *original*
-    frame. Mirrors ImageJ — stops per-pixel noise from poking through the ball.
+    Both run on a downscaled copy (ImageJ shrink-factor trick — see apply): a
+    radius-R ball on a 4k frame takes seconds and freezes the GUI, but the
+    background is smooth, so we downscale by ~R/8, estimate the ball, and
+    upscale. Keeps apply() fast enough for live scrubbing (~0.1 s on 4k).
+
+    ``smooth`` (Gaussian kernel, odd, 1=off) denoises the frame *before*
+    subtraction: the output is ``smoothed − background``, so speck noise smaller
+    than the kernel is attenuated instead of surviving (rolling ball alone leaves
+    it — specks are smaller than the ball, so the ball estimate skips over them).
 
     Assumes bright features on a dark background (standard PIV/PTV). Dtype-preserving.
     """
@@ -299,8 +304,22 @@ class RollingBallBgOp(Operation):
         {"key": "radius", "type": "int", "default": 50, "range": [1, 500],
          "label": "Ball radius (px)", "widget": "spinbox"},
         {"key": "smooth", "type": "int", "default": 1, "range": [1, 51],
-         "label": "Pre-smooth kernel (1=off)", "widget": "spinbox", "step": 2},
+         "label": "Denoise kernel (1=off)", "widget": "spinbox", "step": 2},
     ]
+
+    @staticmethod
+    def _estimate_bg(img: np.ndarray, radius: int, method: str) -> np.ndarray:
+        """Background surface of a float32 image at the given ball radius."""
+        if method == "rolling_ball":
+            try:
+                from skimage.restoration import rolling_ball
+            except ImportError:
+                method = "opening"  # scikit-image missing — fall back.
+            else:
+                return rolling_ball(img, radius=radius).astype(np.float32)
+        k = 2 * radius + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        return cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel)
 
     def apply(self, frame: np.ndarray, context=None) -> np.ndarray:
         radius = max(1, int(self.params["radius"]))
@@ -310,28 +329,30 @@ class RollingBallBgOp(Operation):
         src = np.ascontiguousarray(frame)
         work = src.astype(np.float32)
 
-        # Estimate the background surface on a smoothed copy (ImageJ behaviour):
-        # noise on the raw image would let single hot pixels poke through the ball.
-        est = work
+        # Denoise the signal before subtraction. Output is `sig − bg`, so specks
+        # smaller than the kernel get attenuated rather than surviving as residuals
+        # (the ball estimate skips over sub-ball specks, so they'd otherwise remain).
+        sig = work
         if smooth > 1:
             k = smooth if smooth % 2 == 1 else smooth + 1
-            est = cv2.GaussianBlur(work, (k, k), 0)
+            sig = cv2.GaussianBlur(work, (k, k), 0)
 
-        if method == "rolling_ball":
-            try:
-                from skimage.restoration import rolling_ball
-            except ImportError:
-                # scikit-image missing — fall back to the opening approximation.
-                method = "opening"
-            else:
-                bg = rolling_ball(est, radius=radius).astype(np.float32)
+        # ImageJ shrink-factor trick: estimating a radius-R ball directly on a
+        # large frame is O(seconds) and freezes the GUI on every param change.
+        # The background is smooth, so downscale by ~R/8, run the ball on the
+        # small image, and upscale the surface. shrink=1 (no downscale) for small R.
+        H, W = sig.shape
+        shrink = max(1, radius // 8)
+        if shrink > 1:
+            small = cv2.resize(sig, (max(1, W // shrink), max(1, H // shrink)),
+                               interpolation=cv2.INTER_AREA)
+            r_s = max(1, int(round(radius / shrink)))
+            bg_small = self._estimate_bg(small, r_s, method)
+            bg = cv2.resize(bg_small, (W, H), interpolation=cv2.INTER_LINEAR)
+        else:
+            bg = self._estimate_bg(sig, radius, method)
 
-        if method == "opening":
-            k = 2 * radius + 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-            bg = cv2.morphologyEx(est, cv2.MORPH_OPEN, kernel)
-
-        out = work - bg
+        out = sig - bg
         np.clip(out, 0, None, out=out)
 
         if frame.dtype == np.uint8:
