@@ -67,7 +67,7 @@ python main.py
 
 **Shadowgraphy / backlit.** Particles are dark on a bright field. Set the threshold op's *Polarity* to `dark_on_bright`. If you use the intensity watershed, also set its *Invert intensity*. The two switches are independent.
 
-**Mie particle sizing.** Set a scale, threshold the laser-sheet-lit particles, then Analysis → *Mie Particle Sizing*. Each blob's area is treated as its scattering cross-section, a forward Mie curve is inverted per particle, and a Rosin-Rammler fit reports D10/D50/D90.
+**Mie particle sizing.** Set a scale, threshold the laser-sheet-lit particles, then Analysis → *Mie Particle Sizing*. Each blob's area is treated as its scattering cross-section, a forward Mie curve is inverted per particle, and a Rosin-Rammler fit reports D10/D50/D90 as diameters.
 
 ![Mie particle sizing window](docs/mie.png)
 

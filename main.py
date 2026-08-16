@@ -1316,8 +1316,13 @@ class MieAnalysisWindow(QWidget):
     """Mie-scattering particle sizing.
 
     Treats each measured blob area (in m²) as that particle's scattering
-    cross-section C_sca, inverts a forward Mie curve to per-particle radii, and
-    fits a Rosin-Rammler CDF for D10/D50/D90. See mie.py.
+    cross-section C_sca, inverts a forward Mie curve to per-particle radii,
+    doubles them to diameters, and fits a Rosin-Rammler CDF for D10/D50/D90.
+    See mie.py.
+
+    D10/D50/D90 are DIAMETERS. The C_sca plot stays a function of radius (the
+    Mie size parameter is x = k*a); the lower plot and every D-marker are in
+    diameter. Both axes say which.
 
     Method from:
       Dasgupta, Raut, Vadukut, Bose, "Design and Development of a Pneumatic
@@ -1516,7 +1521,7 @@ class MieAnalysisWindow(QWidget):
 
         ctrl_col.addStretch()
 
-        self.export_btn = QPushButton("Export radii CSV…")
+        self.export_btn = QPushButton("Export particle sizes CSV…")
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self._export_csv)
         ctrl_col.addWidget(self.export_btn)
@@ -1576,7 +1581,10 @@ class MieAnalysisWindow(QWidget):
 
         self.cdf_plot = pg.PlotWidget()
         self.cdf_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.cdf_plot.setLabel('bottom', 'particle radius a', units='m')
+        # Diameter, not radius: D10/D50/D90 are diameters, and the markers sit
+        # on this axis. The C_sca plot above stays in radius because the Mie
+        # size parameter x = k*a is defined on radius.
+        self.cdf_plot.setLabel('bottom', 'particle diameter', units='m')
         self.cdf_plot.setLabel('left', 'cumulative fraction')
         self.cdf_legend = self.cdf_plot.addLegend(offset=(-10, 10))
         self.cdf_ph = PlotPlaceholder(
@@ -1891,7 +1899,8 @@ class MieAnalysisWindow(QWidget):
         for card, d in ((self.card_d10, res.D10), (self.card_d50, res.D50),
                         (self.card_d90, res.D90)):
             if np.isfinite(d):
-                card.set_value(f"{um(d):.3g} µm", f"{d:.3e} m · {src_tag}")
+                card.set_value(f"{um(d):.3g} µm",
+                               f"diameter · {d:.3e} m · {src_tag}")
             else:
                 card.set_value("—", "not available")
         if res.rr_ok:
@@ -1997,20 +2006,23 @@ class MieAnalysisWindow(QWidget):
             symbolBrush=(190, 190, 190), symbolPen=None, name='measured',
         )
         # Rosin-Rammler curve only when the fit converged (NaN params otherwise).
+        # Evaluated on the DIAMETER grid: the fit is on diameters, so rr_b is a
+        # diameter scale and plotting it against res.a (radius) would put the
+        # curve at half the x of the D-markers.
         if res.rr_ok and np.isfinite(res.rr_b) and np.isfinite(res.rr_c):
-            a = res.a
-            rr = 1.0 - np.exp(-((a / res.rr_b) ** res.rr_c))
-            self.cdf_plot.plot(a, rr, pen=pg.mkPen((255, 140, 90), width=2),
+            d = 2.0 * res.a
+            rr = 1.0 - np.exp(-((d / res.rr_b) ** res.rr_c))
+            self.cdf_plot.plot(d, rr, pen=pg.mkPen((255, 140, 90), width=2),
                                name='Rosin-Rammler fit')
         self._d_lines(res)
         self._fit_x_to_data(res)
 
     def _draw_pdf(self, res):
-        """Radius histogram. The CDF alone hides the mode and any bimodality —
+        """Diameter histogram. The CDF alone hides the mode and any bimodality —
         the shape most people look for first in a spray."""
         self.cdf_plot.setLabel('left', 'particle count')
         self.cdf_plot.setTitle("Size distribution")
-        r = res.radii[np.isfinite(res.radii) & (res.radii > 0)]
+        r = res.diameters[np.isfinite(res.diameters) & (res.diameters > 0)]
         if r.size == 0:
             return
         nbins = int(np.clip(np.sqrt(r.size), 20, 200))
@@ -2027,9 +2039,9 @@ class MieAnalysisWindow(QWidget):
 
     def _fit_x_to_data(self, res):
         """Frame the x-axis on the particles, not the sweep. The RR curve is
-        evaluated over the whole radius grid, which used to stretch the axis far
+        evaluated over the whole size grid, which used to stretch the axis far
         past the largest particle and leave most of the plot empty."""
-        r = res.radii[np.isfinite(res.radii) & (res.radii > 0)]
+        r = res.diameters[np.isfinite(res.diameters) & (res.diameters > 0)]
         if r.size == 0:
             return
         hi = max(float(np.percentile(r, 99.9)), float(res.D90) if np.isfinite(res.D90) else 0.0)
@@ -2040,25 +2052,27 @@ class MieAnalysisWindow(QWidget):
         if res is None:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export radii CSV", "", "CSV files (*.csv)"
+            self, "Export particle sizes CSV", "", "CSV files (*.csv)"
         )
         if not path:
             return
         lines = [
             f"# Mie particle sizing — Dasgupta et al., J. Flow Vis. Image Proc. 32(3), 2025",
+            f"# D-values are DIAMETERS (m). The inversion works in radius; both are given per particle.",
             f"# n_sphere={res.n_sphere}, lambda_nm={res.lam_nm}, n_medium={res.n_medium}, mu={res.mu}",
             f"# D10_m={res.D10:.6e}, D50_m={res.D50:.6e}, D90_m={res.D90:.6e}, "
             f"source={'rosin_rammler' if res.rr_ok else 'empirical_percentiles'}",
             f"# emp_D10_m={res.emp_D10:.6e}, emp_D50_m={res.emp_D50:.6e}, emp_D90_m={res.emp_D90:.6e}",
-            f"# RR_b={res.rr_b:.6e}, RR_c={res.rr_c:.6e}, R2={res.r2:.6f}, RR_ok={res.rr_ok}",
-            "particle_idx,area_m2,radius_m,radius_um",
+            f"# RR_b={res.rr_b:.6e} (diameter scale), RR_c={res.rr_c:.6e}, R2={res.r2:.6f}, RR_ok={res.rr_ok}",
+            "particle_idx,area_m2,radius_m,radius_um,diameter_m,diameter_um",
         ]
         for i, (area, r) in enumerate(zip(self._areas_m2, res.radii)):
-            lines.append(f"{i},{area:.6e},{r:.6e},{r * 1e6:.6g}")
+            lines.append(f"{i},{area:.6e},{r:.6e},{r * 1e6:.6g},"
+                         f"{2 * r:.6e},{2 * r * 1e6:.6g}")
         try:
             with open(path, 'w') as f:
                 f.write("\n".join(lines))
-            self._set_status(f"Exported {res.radii.size} radii → {path}", "ok")
+            self._set_status(f"Exported {res.radii.size} particles → {path}", "ok")
         except OSError as e:
             QMessageBox.critical(self, "Export Failed", str(e))
 

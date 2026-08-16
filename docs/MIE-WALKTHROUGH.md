@@ -12,8 +12,13 @@ answer is sensitive to a choice you made earlier.
 
 **The short version:** each blob in the binary mask is treated as one particle,
 its area is its scattering cross-section C_sca, a forward Mie curve C_sca(a) is
-inverted per particle to a radius, and the radii are fit with a Rosin-Rammler
-model that reports D10/D50/D90.
+inverted per particle to a radius, and the doubled radii are fit with a
+Rosin-Rammler model that reports D10/D50/D90.
+
+**D10/D50/D90 are diameters**, as the D notation implies. The forward curve is
+a function of radius, because the Mie size parameter is defined on radius, so
+the C_sca plot has a radius axis while the size distribution below it has a
+diameter axis. Both say which.
 
 **Before you start you need three things:**
 
@@ -130,16 +135,16 @@ on this sequence, everything else held fixed:
 
 | min_area (px²) | blobs | D10 (µm) | D50 (µm) | D90 (µm) | R² |
 |---|---|---|---|---|---|
-| 0 (off) | 81,370 | 0.169 | 1.012 | 3.170 | 0.985 |
-| 2 | 57,141 | 0.487 | 1.610 | 3.449 | 0.991 |
-| 3 | 46,793 | 0.769 | 1.953 | 3.538 | 0.995 |
-| 4 | 41,320 | 1.002 | 2.168 | 3.544 | 0.998 |
-| 6 | 35,040 | 1.312 | 2.420 | 3.576 | 0.999 |
-| 9 | 29,696 | 1.633 | 2.637 | 3.578 | 0.999 |
+| 0 (off) | 81,370 | 0.338 | 2.025 | 6.340 | 0.985 |
+| 2 | 57,141 | 0.975 | 3.221 | 6.898 | 0.991 |
+| 3 | 46,793 | 1.538 | 3.906 | 7.077 | 0.995 |
+| 4 | 41,320 | 2.005 | 4.336 | 7.089 | 0.998 |
+| 6 | 35,040 | 2.624 | 4.841 | 7.152 | 0.999 |
+| 9 | 29,696 | 3.266 | 5.273 | 7.157 | 0.999 |
 
 Three things to take from that table:
 
-- **D90 is robust.** It moves 13% across the whole range. D10 moves 10x.
+- **D90 is robust.** It moves 13% across the whole range. D10 moves nearly 10x.
 - **There is no plateau.** min_area does not converge on a true answer, so
   quote it alongside any D-value you report.
 - **Rising R² is not evidence of correctness.** Trimming the tail off a
@@ -199,9 +204,9 @@ mean of the curve instead, which is what you want when sizing a population.
 
 ![Mie results](walkthrough/08-mie-results.png)
 
-1. **D50**, the median radius. 1.61 µm here. The small print under each card
-   gives the value in metres and says whether it came from the Rosin-Rammler
-   fit or from empirical percentiles.
+1. **D50**, the median diameter. 3.22 µm here. The small print under each card
+   confirms the quantity, gives the value in metres, and says whether it came
+   from the Rosin-Rammler fit or from empirical percentiles.
 2. **Fit quality.** R² 0.9912, with the fitted b and c. If the fit fails to
    converge the window says so and falls back to percentiles, which are
    distribution-free and stay usable on small samples.
@@ -210,8 +215,9 @@ mean of the curve instead, which is what you want when sizing a population.
    against either end of the curve, your sweep does not cover your data.
 4. **Cost estimate**, shown before you commit: 174 Mie orders x 4000 grid
    points, about 10 s. Cancel works during the sweep.
-5. **The Rosin-Rammler fit.** Dots are measured, the line is the fit, and the
-   dashed markers are D10/D50/D90.
+5. **The Rosin-Rammler fit**, against diameter. Dots are measured, the line is
+   the fit, and the dashed markers are D10/D50/D90. Note the axis: the curve
+   above it is in radius, this one is in diameter.
 
 If particles get clamped to either end of the sweep, a warning appears above
 the plots and the fix depends on which end:
@@ -225,17 +231,17 @@ the plots and the fix depends on which end:
 
 Switch the lower plot to **Size distribution**.
 
-![Radius histogram](walkthrough/09-mie-histogram.png)
+![Diameter histogram](walkthrough/09-mie-histogram.png)
 
 1. Lower plot selector.
-2. The radius histogram, with the same D-value markers.
+2. The diameter histogram, with the same D-value markers.
 
 Always look at this before quoting a D50. A cumulative curve hides the mode and
 it hides bimodality completely. Two populations that a CDF renders as one gentle
 S-curve are obvious here.
 
-**Export radii CSV** writes the per-particle radii along with a header
-recording every input, so a run can be reproduced.
+**Export particle sizes CSV** writes each particle's area, radius and diameter,
+along with a header recording every input, so a run can be reproduced.
 
 ---
 
@@ -250,6 +256,8 @@ Quote all of these together, because each one moves the answer:
   *Legacy* only if you are matching an older run)
 - Number of particles sized
 - Whether D-values came from the Rosin-Rammler fit or from percentiles
+- That the D-values are diameters, since not every tool reporting a "D50"
+  means the same thing by it
 
 ## Method
 

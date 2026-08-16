@@ -5,12 +5,24 @@ contract as measurement.py.
 Premise (from the laser-sheet / MATLAB workflow this ports): the measured area of
 a laser-sheet-lit particle blob, expressed in m², is taken to be that particle's
 scattering cross-section C_sca [m²]. A forward Mie curve C_sca(a) is computed over
-a radius sweep, then inverted per particle (area -> radius). The radii are binned
-into a CDF and fit with a Rosin-Rammler model to report D10/D50/D90.
+a radius sweep, then inverted per particle (area -> radius). Radii are doubled to
+diameters, binned into a CDF, and fit with a Rosin-Rammler model to report
+D10/D50/D90.
 
 Ported 1:1 from Mie_scattering_MATLAB/b_mie_v2 (calculateMieScattering.m, mie_coeff.m,
 sphbes.m, sphankel.m). scipy.special.jv/yv replace MATLAB besselj/bessely and accept
 the complex argument z = m*x directly, so the port is numerically faithful.
+
+D-VALUES ARE DIAMETERS. The .m files stop at radius: they interpolate D10/D50/D90
+on the radius grid and plot them against an axis labelled "Radius [m]". In the
+original workflow the doubling happened afterwards, in a separate Python step
+that exported the MATLAB results and rebuilt the CDF on 2*r, so the published
+numbers are diameters. That step lives here now. tiffscope's D-values are 2x
+what the .m files alone produce and agree with the publication.
+
+Everything upstream of the reporting boundary still works in radius: the Mie
+size parameter is x = k*a, the sweep is a radius sweep, and `MieResult.radii`
+is the raw inversion output.
 """
 from __future__ import annotations
 
@@ -213,16 +225,28 @@ class MieResult:
     a: np.ndarray                 # radius grid (m)
     csca: np.ndarray              # C_sca(a) (m²)
     radii: np.ndarray             # per-particle inverted radii (m)
-    # Rosin-Rammler fit
+    diameters: np.ndarray         # per-particle diameters (m) == 2 * radii
+    # Rosin-Rammler fit — fitted on DIAMETERS, so rr_b is a diameter scale.
     rr_b: float
     rr_c: float
     r2: float
-    # D-values: RR-fit when the fit converged, else empirical percentiles (below).
+    # D-values are DIAMETERS (m), the field convention. RR-fit when the fit
+    # converged, else the empirical percentiles below.
+    #
+    # The .m files stop at radius (calculateMieScattering.m:
+    # interp1(fit_curve, a_unique, 0.5)) and label the plot axis "Radius [m]".
+    # The doubling was done afterwards, outside MATLAB, when the results were
+    # exported and the CDF rebuilt on 2*r in Python. Folding that step in here
+    # is what makes these agree with the published values, and it is also the
+    # only reading that matches universal usage, where D means diameter.
+    # `radii` keeps the raw inversion output, and the C_sca curve stays a
+    # function of radius (the Mie size parameter x = k*a is defined on radius).
     D10: float
     D50: float
     D90: float
-    # Empirical percentile D-values — always finite for n >= 1. Distribution-free,
-    # so they stay meaningful when the sample is too small for a Rosin-Rammler fit.
+    # Empirical percentile D-values (diameters) — always finite for n >= 1.
+    # Distribution-free, so they stay meaningful when the sample is too small
+    # for a Rosin-Rammler fit.
     emp_D10: float = float("nan")
     emp_D50: float = float("nan")
     emp_D90: float = float("nan")
@@ -231,15 +255,20 @@ class MieResult:
     cdf_values: np.ndarray = field(default_factory=lambda: np.array([]))
 
 
-def rosin_rammler_fit(radii: np.ndarray, num_bins: int = 50):
-    """Bin radii into an empirical CDF and fit the Rosin-Rammler model.
+def rosin_rammler_fit(sizes: np.ndarray, num_bins: int = 50):
+    """Bin sizes into an empirical CDF and fit the Rosin-Rammler model.
 
-    Returns (b, c, r2, D10, D50, D90, bin_centers, cdf). Ported from
+    `sizes` is whatever quantity the D-values should be reported in. `analyze`
+    passes DIAMETERS, so b and the returned D-values are diameters. The model
+    is a scale family, so feeding radii instead returns exactly half of each
+    (and the same c and R²).
+
+    Returns (b, c, r2, D10, D50, D90, bin_centers, cdf). Structure ported from
     calculateMieScattering.m (histogram -> cumulative -> fit -> D-values).
     """
-    radii = np.asarray(radii, dtype=float)
-    radii = radii[np.isfinite(radii)]
-    counts, edges = np.histogram(radii, bins=num_bins)
+    sizes = np.asarray(sizes, dtype=float)
+    sizes = sizes[np.isfinite(sizes)]
+    counts, edges = np.histogram(sizes, bins=num_bins)
     centers = 0.5 * (edges[:-1] + edges[1:])
     total = counts.sum()
     cdf = np.cumsum(counts) / total if total else np.zeros_like(counts, dtype=float)
@@ -251,7 +280,7 @@ def rosin_rammler_fit(radii: np.ndarray, num_bins: int = 50):
     # Seed b at the median radius (robust scale estimate) rather than the mean of
     # the bin centres — the latter is pulled toward empty high-radius bins for
     # small samples and gives curve_fit a poor start.
-    med = float(np.median(radii)) if radii.size else 0.0
+    med = float(np.median(sizes)) if sizes.size else 0.0
     p0 = [max(med, 1e-30), 1.0]
     try:
         popt, _ = curve_fit(_rosin_rammler, centers, cdf, p0=p0,
@@ -281,7 +310,11 @@ def analyze(areas_m2: np.ndarray, n_real: float, n_imag: float,
             n_medium: float = 1.0, mu: float = 1.0,
             num_a: int = 50000, num_bins: int = 50,
             inversion: str = "trend", progress_cb=None) -> MieResult:
-    """End-to-end: areas (m²) -> radii -> Rosin-Rammler -> D10/D50/D90.
+    """End-to-end: areas (m²) -> radii -> diameters -> Rosin-Rammler -> D10/D50/D90.
+
+    D10/D50/D90 are DIAMETERS, which is what D means in particle sizing and what
+    the published values are. The .m files stop at radius and were doubled in a
+    separate post-processing step; that step is folded in here. See MieResult.
 
     Mirrors SubmitData.m defaults (527 nm, air, mu=1, 50000-point radius sweep).
     `inversion` selects the area->radius map: 'trend' (default, grid-stable) or
@@ -298,13 +331,19 @@ def analyze(areas_m2: np.ndarray, n_real: float, n_imag: float,
     csca = csca_curve(a, lam_nm, n_medium, n_sphere, mu, progress_cb=progress_cb)
     ripple_da = lam_nm * 1e-9 / (2.0 * n_medium)   # Δa per Mie ripple
     radii = invert_areas(areas_m2, a, csca, method=inversion, ripple_da=ripple_da)
-    b, c, r2, d10, d50, d90, centers, cdf = rosin_rammler_fit(radii, num_bins)
+
+    # D-values are reported as DIAMETERS. The inversion is defined on radius
+    # (the Mie size parameter is x = k*a), so the conversion happens here, once,
+    # at the reporting boundary — the same place the original workflow did it,
+    # just no longer by hand. See MieResult.
+    diameters = 2.0 * radii
+    b, c, r2, d10, d50, d90, centers, cdf = rosin_rammler_fit(diameters, num_bins)
 
     # Empirical percentile D-values — distribution-free, always finite for n >= 1.
     # For small samples that defeat the RR fit these are the usable result.
-    rf = radii[np.isfinite(radii) & (radii > 0)]
-    if rf.size:
-        e10, e50, e90 = (float(np.percentile(rf, p)) for p in (10, 50, 90))
+    df = diameters[np.isfinite(diameters) & (diameters > 0)]
+    if df.size:
+        e10, e50, e90 = (float(np.percentile(df, p)) for p in (10, 50, 90))
     else:
         e10 = e50 = e90 = float("nan")
 
@@ -316,6 +355,7 @@ def analyze(areas_m2: np.ndarray, n_real: float, n_imag: float,
     return MieResult(
         lam_nm=lam_nm, n_medium=n_medium, n_sphere=n_sphere, mu=mu,
         a_start=a_start, a_stop=a_stop, a=a, csca=csca, radii=radii,
+        diameters=diameters,
         rr_b=b, rr_c=c, r2=r2, D10=D10, D50=D50, D90=D90,
         emp_D10=e10, emp_D50=e50, emp_D90=e90, rr_ok=bool(rr_ok),
         cdf_bin_centers=centers, cdf_values=cdf,
