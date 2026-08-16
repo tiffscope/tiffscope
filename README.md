@@ -71,6 +71,9 @@ python main.py
 
 ![Mie particle sizing window](docs/mie.png)
 
+Step by step, with screenshots and the caveats that matter:
+**[Mie sizing walkthrough](docs/MIE-WALKTHROUGH.md)**.
+
 **Coating thickness.** Click the interface and outer surface on an SEM cross-section. Thickness is measured perpendicular to the fitted facet, with the fit residual as the error bar.
 
 ## Notes
