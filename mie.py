@@ -49,6 +49,11 @@ def area_unit_to_m2_factor(unit: str) -> float | None:
 
 # --- spherical Bessel / Hankel (MATLAB sphbes / sphankel) ------------------
 
+class MieCancelled(Exception):
+    """Raised when a progress_cb asks csca_curve to stop. Distinct from a real
+    error so callers can treat a user cancel as a normal outcome."""
+
+
 def _sphbes(nu: int, x: np.ndarray) -> np.ndarray:
     """Spherical Bessel function of the first kind. Accepts real or complex x."""
     return np.sqrt(np.pi / (2.0 * x)) * jv(nu + 0.5, x)
@@ -80,7 +85,8 @@ def _mie_coeff(n: int, x: np.ndarray, z: np.ndarray, mu: float, m: complex):
 
 
 def csca_curve(a: np.ndarray, lam_nm: float, n_medium: float,
-               n_sphere: complex, mu: float = 1.0) -> np.ndarray:
+               n_sphere: complex, mu: float = 1.0,
+               progress_cb=None) -> np.ndarray:
     """Forward Mie scattering cross-section C_sca(a) in m².
 
     a       : radius grid in metres (array)
@@ -88,6 +94,12 @@ def csca_curve(a: np.ndarray, lam_nm: float, n_medium: float,
     n_medium: real refractive index of the medium
     n_sphere: complex refractive index of the particle
     mu      : ratio of magnetic permeability (sphere/medium), usually 1
+    progress_cb: optional ``f(order_done, order_total) -> bool``. Called once per
+              Mie order — the only natural chunk boundary in this sum, and the
+              loop dominates runtime, so it is where a determinate progress bar
+              and a cooperative cancel both belong. Return False to abort; the
+              partial sum is discarded and MieCancelled is raised. Deliberately a
+              plain callable, not a Qt signal — mie.py stays GUI-free.
     """
     a = np.asarray(a, dtype=float)
     k = 2.0 * np.pi / (lam_nm * 1e-9) * n_medium
@@ -112,6 +124,8 @@ def csca_curve(a: np.ndarray, lam_nm: float, n_medium: float,
             an, bn = _mie_coeff(n, x, z, mu, m)
             term = pref * (2 * n + 1) * (np.abs(an) ** 2 + np.abs(bn) ** 2)
             np.add(csca, term, out=csca, where=np.isfinite(term))
+            if progress_cb is not None and progress_cb(n, n_max) is False:
+                raise MieCancelled("Mie sweep cancelled")
 
     # Guard against any residual NaN (e.g. the near-zero grid edge). MATLAB used
     # fillmissing(..., 'linear', 'extrap') here.
@@ -266,7 +280,7 @@ def analyze(areas_m2: np.ndarray, n_real: float, n_imag: float,
             a_start: float, a_stop: float, *, lam_nm: float = 527.0,
             n_medium: float = 1.0, mu: float = 1.0,
             num_a: int = 50000, num_bins: int = 50,
-            inversion: str = "trend") -> MieResult:
+            inversion: str = "trend", progress_cb=None) -> MieResult:
     """End-to-end: areas (m²) -> radii -> Rosin-Rammler -> D10/D50/D90.
 
     Mirrors SubmitData.m defaults (527 nm, air, mu=1, 50000-point radius sweep).
@@ -281,7 +295,7 @@ def analyze(areas_m2: np.ndarray, n_real: float, n_imag: float,
 
     n_sphere = complex(n_real, n_imag)
     a = np.linspace(a_start, a_stop, num_a)
-    csca = csca_curve(a, lam_nm, n_medium, n_sphere, mu)
+    csca = csca_curve(a, lam_nm, n_medium, n_sphere, mu, progress_cb=progress_cb)
     ripple_da = lam_nm * 1e-9 / (2.0 * n_medium)   # Δa per Mie ripple
     radii = invert_areas(areas_m2, a, csca, method=inversion, ripple_da=ripple_da)
     b, c, r2, d10, d50, d90, centers, cdf = rosin_rammler_fit(radii, num_bins)

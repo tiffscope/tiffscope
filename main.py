@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QWidget, QLabel, QFileDialog, QSlider, QMessageBox, QDialog, QComboBox,
     QSpinBox, QDialogButtonBox, QProgressDialog, QPushButton, QLineEdit,
     QListWidget, QListWidgetItem, QCheckBox, QGroupBox, QScrollArea,
-    QSizePolicy, QRadioButton, QButtonGroup,
+    QSizePolicy, QRadioButton, QButtonGroup, QFrame, QGridLayout, QProgressBar,
 )
 from PyQt6.QtCore import Qt, QRectF, QThread, pyqtSignal, QEventLoop
 from PyQt6.QtGui import QShortcut, QKeySequence, QAction, QActionGroup, QColor, QIntValidator, QDoubleValidator
@@ -20,8 +20,10 @@ from PyQt6.QtGui import QShortcut, QKeySequence, QAction, QActionGroup, QColor, 
 from image_engine import LazyTiffSequence, scale_16bit_to_8bit, build_display_lut
 from operations import (
     Operation, RotateOp, CropOp, BgSubtractOp, RollingBallBgOp, AdaptiveThresholdOp,
+    GlobalThresholdOp,
     CLAHEOp, GaussianBlurOp, SharpenOp, LowPassOp, HighPassOp,
-    MorphologyOp, BinarySmoothOp, WatershedSplitOp, IntensityWatershedSplitOp,
+    MorphologyOp, BinarySmoothOp, BlobSizeFilterOp, WatershedSplitOp,
+    IntensityWatershedSplitOp,
     OPERATION_REGISTRY,
 )
 from pipeline import Pipeline
@@ -82,7 +84,7 @@ class ThresholdBatchWorker(QThread):
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
 
-    def __init__(self, op: AdaptiveThresholdOp, pipeline: Pipeline, op_idx: int,
+    def __init__(self, op: Operation, pipeline: Pipeline, op_idx: int,
                  file_paths: list):
         super().__init__()
         self.op = op
@@ -107,6 +109,89 @@ class ThresholdBatchWorker(QThread):
             self.finished.emit(masks)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class PlotPlaceholder:
+    """Centred hint shown on an analysis plot until it has data.
+
+    Every analysis window opens on an empty plot whose auto-range invents a
+    0.1–0.9 tick grid — it reads as a broken chart rather than an idle one.
+    Hiding the axes and stating what to do instead makes the idle state honest.
+    """
+
+    def __init__(self, plot_widget: pg.PlotWidget, text: str):
+        self._plot = plot_widget
+        self._item = pg.TextItem(text, color=(138, 138, 138), anchor=(0.5, 0.5))
+        self._attach()
+        self._shown = True
+        self._apply(True)
+
+    def _attach(self):
+        """(Re)add the hint item. PlotWidget.clear() drops every item, so a
+        window that clears before each redraw would otherwise lose it for good."""
+        if self._item not in self._plot.getPlotItem().items:
+            self._plot.addItem(self._item)
+        self._item.setPos(0.5, 0.5)
+
+    def _apply(self, showing: bool):
+        pi = self._plot.getPlotItem()
+        pi.showAxis('bottom', not showing)
+        pi.showAxis('left', not showing)
+        pi.showGrid(x=not showing, y=not showing, alpha=0.3)
+        if showing:
+            # Pin the view so the hint sits dead centre.
+            self._plot.setXRange(0, 1, padding=0)
+            self._plot.setYRange(0, 1, padding=0)
+        else:
+            # Hand the view back to autorange. Without this the 0-1 window above
+            # survives into the real plot and the data draws off-screen.
+            pi.enableAutoRange(axis='xy', enable=True)
+
+    def set_text(self, text: str):
+        self._item.setText(text)
+
+    def hide(self):
+        """Call once real data is plotted. Idempotent."""
+        if not self._shown:
+            return
+        self._shown = False
+        self._item.setVisible(False)
+        self._apply(False)
+
+    def show(self, text: str | None = None):
+        if text is not None:
+            self._item.setText(text)
+        self._shown = True
+        self._attach()
+        self._item.setVisible(True)
+        self._apply(True)
+
+
+def format_stats_grid(pairs, columns: int = 4, notes=None) -> str:
+    """Render (label, value) pairs as an aligned HTML grid for a QLabel.
+
+    The stats bars were single run-on strings joined by " | ", which wrapped
+    mid-item at any narrow window width ("Max: 165" landing alone on line 2)
+    and gave nothing to scan down. A table keeps labels and values aligned in
+    columns and wraps at cell boundaries.
+
+    `notes` are appended as full-width lines under the grid (scale reminders and
+    similar), which is where they read as context rather than as another stat.
+    """
+    cells = []
+    for label, value in pairs:
+        cells.append(
+            f'<td style="padding:0 14px 2px 0; white-space:nowrap;">'
+            f'<span style="color:#8a8a8a;">{label}</span>&nbsp;'
+            f'<span style="color:#ececec; font-weight:600;">{value}</span></td>'
+        )
+    rows = []
+    for i in range(0, len(cells), columns):
+        rows.append("<tr>" + "".join(cells[i:i + columns]) + "</tr>")
+    html = f'<table style="border-collapse:collapse;">{"".join(rows)}</table>'
+    for note in (notes or []):
+        html += f'<div style="color:#8a8a8a; padding-top:3px;">{note}</div>'
+    return html
 
 
 class BlobSizeAnalysisWorker(QThread):
@@ -331,6 +416,9 @@ class PerformanceToolWindow(QWidget):
             f"FPS: {fps:5.1f}   |   Frame total — last: {last_total:6.2f} ms   "
             f"avg30: {avg_total:6.2f} ms   |   Frames: {self.main_app.perf.frame_count}"
         )
+        # The header is a single long line; without wrapping the trailing frame
+        # count is clipped at the default window width.
+        self.header_label.setWordWrap(True)
 
         from PyQt6.QtWidgets import QTableWidgetItem
         self.table.setRowCount(len(rows))
@@ -385,6 +473,23 @@ class BlobSizeAnalysisWindow(QWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(6)
 
+        # --- Stage row ---
+        # Which mask the sizes are measured on. Without this the window silently
+        # measured the full binary chain, which became genuinely ambiguous once
+        # BlobSizeFilterOp existed — "blob sizes" before or after filtering?
+        stage_row = QHBoxLayout()
+        stage_row.addWidget(QLabel("Binary stage:"))
+        self.stage_combo = QComboBox()
+        self.stage_combo.setMinimumWidth(220)
+        self.stage_combo.setToolTip(
+            "Mask stage the sizes are measured on.\n"
+            "IntensityWatershedSplitOp is never included — this window exists to "
+            "pick its min_blob_area, so it must show the mask that op receives."
+        )
+        stage_row.addWidget(self.stage_combo)
+        stage_row.addStretch()
+        layout.addLayout(stage_row)
+
         # --- Controls row ---
         ctrl = QHBoxLayout()
         ctrl.addWidget(QLabel("Sample frames:"))
@@ -428,6 +533,8 @@ class BlobSizeAnalysisWindow(QWidget):
         )
         self._vline.setVisible(False)
         self.plot_widget.addItem(self._vline)
+        self._placeholder = PlotPlaceholder(
+            self.plot_widget, "Run Analysis to collect blob areas")
         layout.addWidget(self.plot_widget, stretch=1)
 
         # --- Options row ---
@@ -446,24 +553,77 @@ class BlobSizeAnalysisWindow(QWidget):
 
     # ------------------------------------------------------------------
 
+    def _chain_candidates(self):
+        """Enabled binary-chain ops eligible for this window.
+
+        IntensityWatershedSplitOp is always excluded: this window's job is to
+        pick that op's min_blob_area, so it must report the mask going *into*
+        it, never its output.
+        """
+        app = self.main_app
+        thresh_idx, thresh_op = app._find_threshold_op()
+        if thresh_op is None:
+            return -1, None, []
+        ops = [
+            op for op in app.pipeline.operations[thresh_idx + 1:]
+            if op.enabled
+            and getattr(op, "is_binary_mask_op", False)
+            and not isinstance(op, IntensityWatershedSplitOp)
+        ]
+        return thresh_idx, thresh_op, ops
+
+    def _rebuild_stage_combo(self):
+        app = self.main_app
+        self.stage_combo.blockSignals(True)
+        prev = self.stage_combo.currentText()
+        self.stage_combo.clear()
+        _, thresh_op, ops = self._chain_candidates()
+        if thresh_op is None:
+            self.stage_combo.addItem("(No threshold op)")
+            self.stage_combo.blockSignals(False)
+            return
+        self.stage_combo.addItem(f"{type(thresh_op).display()} output")
+        for op in ops:
+            self.stage_combo.addItem(f"After {type(op).display()}")
+        idx = self.stage_combo.findText(prev)
+        # Default to the end of the eligible chain — the mask
+        # IntensityWatershedSplitOp actually receives.
+        self.stage_combo.setCurrentIndex(idx if idx >= 0 else self.stage_combo.count() - 1)
+        self.stage_combo.blockSignals(False)
+
+    def _binary_ops_for_selected_stage(self):
+        _, thresh_op, ops = self._chain_candidates()
+        if thresh_op is None:
+            return []
+        text = self.stage_combo.currentText()
+        if text == f"{type(thresh_op).display()} output":
+            return []
+        out = []
+        for op in ops:
+            out.append(op)
+            if text == f"After {type(op).display()}":
+                break
+        return out
+
+    def _stage_description(self) -> str:
+        text = self.stage_combo.currentText()
+        n = len(self._binary_ops_for_selected_stage())
+        if n == 0:
+            return f"{text} (no binary-chain ops applied)"
+        return f"{text} ({n} binary-chain op{'s' if n != 1 else ''} applied)"
+
     def _run(self):
         app = self.main_app
         if app.sequence_manager is None:
             self.stats_label.setText("No sequence loaded.")
             return
 
-        thresh_idx, thresh_op = app._find_op(AdaptiveThresholdOp)
+        thresh_idx, thresh_op, _ = self._chain_candidates()
         if thresh_op is None or not thresh_op.enabled:
-            self.stats_label.setText("No enabled AdaptiveThresholdOp in pipeline.")
+            self.stats_label.setText("No enabled threshold op in pipeline.")
             return
 
-        # Binary chain ops after thresh, excluding IntensityWatershedSplitOp
-        binary_ops = [
-            op for op in app.pipeline.operations[thresh_idx + 1:]
-            if op.enabled
-            and getattr(op, "is_binary_mask_op", False)
-            and not isinstance(op, IntensityWatershedSplitOp)
-        ]
+        binary_ops = self._binary_ops_for_selected_stage()
 
         n_frames = app.sequence_manager.num_frames
         if self.all_check.isChecked():
@@ -522,6 +682,7 @@ class BlobSizeAnalysisWindow(QWidget):
         areas = self._areas
         if not areas:
             return
+        self._placeholder.hide()
 
         arr = np.array(areas, dtype=np.float64)
         # Bin count: sqrt rule, clamped to [30, 300]
@@ -540,6 +701,9 @@ class BlobSizeAnalysisWindow(QWidget):
         )
         self.plot_widget.addItem(self._bar_item)
         self.plot_widget.setLabel('left', 'log₁₀(count+1)' if use_log else 'Count')
+        # Frame on the data. pyqtgraph's autorange pads generously, leaving a
+        # long empty tail (axis to 175 px² for data ending near 90).
+        self.plot_widget.setXRange(float(edges[0]), float(edges[-1]), padding=0.02)
 
         # Update min_blob_area line
         _, iw_op = self.main_app._find_op(IntensityWatershedSplitOp)
@@ -554,21 +718,24 @@ class BlobSizeAnalysisWindow(QWidget):
         median = float(np.median(arr))
         p95 = float(np.percentile(arr, 95))
         p99 = float(np.percentile(arr, 99))
-        stats_text = (
-            f"Blobs: {len(arr):,}   |   "
-            f"Median: {median:.0f} px²   |   "
-            f"95th pct: {p95:.0f} px²   |   "
-            f"99th pct: {p99:.0f} px²   |   "
-            f"Max: {arr.max():.0f} px²"
-        )
+        pairs = [
+            ("Blobs", f"{len(arr):,}"),
+            ("Median", f"{median:.0f} px²"),
+            ("95th pct", f"{p95:.0f} px²"),
+            ("99th pct", f"{p99:.0f} px²"),
+            ("Max", f"{arr.max():.0f} px²"),
+        ]
+        notes = [f"Measured at: {self._stage_description()}"]
         if iw_op is not None and iw_op.enabled:
             mba = iw_op.params.get("min_blob_area", 50)
             n_above = int((arr >= mba).sum())
-            stats_text += f"   |   ≥ min_blob_area ({mba} px²): {n_above:,} blobs"
-        self.stats_label.setText(stats_text)
+            pairs.append((f"≥ min_blob_area ({mba} px²)", f"{n_above:,} blobs"))
+        self.stats_label.setText(format_stats_grid(pairs, columns=3, notes=notes))
 
     def showEvent(self, event):
         super().showEvent(event)
+        # Pipeline may have changed while hidden — restock the stage list first.
+        self._rebuild_stage_combo()
         # Refresh vline whenever window becomes visible in case params changed
         if self._areas:
             self._redraw()
@@ -754,8 +921,12 @@ class RegionPropsWindow(QWidget):
 
         # --- Histogram plot ---
         self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setLabel('bottom', 'Area (px²)')
+        self.plot_widget.setLabel('left', 'Count')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self._bar_item: pg.BarGraphItem | None = None
+        self._placeholder = PlotPlaceholder(
+            self.plot_widget, "Run Analysis to measure region properties")
         layout.addWidget(self.plot_widget, stretch=1)
 
         # --- Stats label ---
@@ -773,36 +944,50 @@ class RegionPropsWindow(QWidget):
         prev_text = self.stage_combo.currentText()
         self.stage_combo.clear()
 
-        thresh_idx, thresh_op = app._find_op(AdaptiveThresholdOp)
+        thresh_idx, thresh_op = app._find_threshold_op()
         if thresh_op is None:
-            self.stage_combo.addItem("(No AdaptiveThresholdOp)")
+            self.stage_combo.addItem("(No threshold op)")
             self.stage_combo.blockSignals(False)
             return
 
-        self.stage_combo.addItem("AdaptiveThresholdOp output")
+        self.stage_combo.addItem(f"{type(thresh_op).display()} output")
         for op in app.pipeline.operations[thresh_idx + 1:]:
             if op.enabled and getattr(op, 'is_binary_mask_op', False):
-                self.stage_combo.addItem(f"After {op.name}")
+                self.stage_combo.addItem(f"After {type(op).display()}")
 
         idx = self.stage_combo.findText(prev_text)
         if idx >= 0:
             self.stage_combo.setCurrentIndex(idx)
+        else:
+            # Default to the END of the binary chain, not the bare threshold
+            # output. Mie sizing consumes the full chain, so defaulting to the
+            # threshold stage made the two windows report different numbers for
+            # the same data with nothing on screen to explain the difference.
+            self.stage_combo.setCurrentIndex(self.stage_combo.count() - 1)
         self.stage_combo.blockSignals(False)
+
+    def _stage_description(self) -> str:
+        """Human sentence naming the mask stage these numbers came from."""
+        text = self.stage_combo.currentText()
+        n_ops = len(self._binary_ops_for_selected_stage())
+        if n_ops == 0:
+            return f"{text} (no binary-chain ops applied)"
+        return f"{text} ({n_ops} binary-chain op{'s' if n_ops != 1 else ''} applied)"
 
     def _binary_ops_for_selected_stage(self):
         """Return binary chain ops to apply up to and including selected stage."""
         app = self.main_app
-        thresh_idx, thresh_op = app._find_op(AdaptiveThresholdOp)
+        thresh_idx, thresh_op = app._find_threshold_op()
         if thresh_op is None:
             return []
         stage_text = self.stage_combo.currentText()
-        if stage_text == "AdaptiveThresholdOp output":
+        if stage_text == f"{type(thresh_op).display()} output":
             return []
         ops = []
         for op in app.pipeline.operations[thresh_idx + 1:]:
             if op.enabled and getattr(op, 'is_binary_mask_op', False):
                 ops.append(op)
-                if stage_text == f"After {op.name}":
+                if stage_text == f"After {type(op).display()}":
                     break
         return ops
 
@@ -812,9 +997,9 @@ class RegionPropsWindow(QWidget):
             self.stats_label.setText("No sequence loaded.")
             return
 
-        thresh_idx, thresh_op = app._find_op(AdaptiveThresholdOp)
+        thresh_idx, thresh_op = app._find_threshold_op()
         if thresh_op is None or not thresh_op.enabled:
-            self.stats_label.setText("No enabled AdaptiveThresholdOp in pipeline.")
+            self.stats_label.setText("No enabled threshold op in pipeline.")
             return
 
         binary_ops = self._binary_ops_for_selected_stage()
@@ -895,6 +1080,7 @@ class RegionPropsWindow(QWidget):
         results = self._results
         if not results or 'area' not in results or len(results['area']) == 0:
             return
+        self._placeholder.hide()
 
         stat_idx = self.stat_combo.currentIndex()
         key, label, px_unit, dim_power = self._STAT_KEYS[stat_idx]
@@ -914,6 +1100,9 @@ class RegionPropsWindow(QWidget):
             brush=(100, 180, 255, 180), pen=pg.mkPen(None),
         )
         self.plot_widget.addItem(self._bar_item)
+        # See BlobSizeAnalysisWindow._redraw — frame on the data, not on
+        # pyqtgraph's padded autorange.
+        self.plot_widget.setXRange(float(edges[0]), float(edges[-1]), padding=0.02)
 
         x_label = f"{label} ({px_unit})" if px_unit else label
         self.plot_widget.setLabel('bottom', x_label)
@@ -932,45 +1121,39 @@ class RegionPropsWindow(QWidget):
         def _fmtv(v):
             return f"{v:.3g}"
 
+        notes = [f"Measured at: {self._stage_description()}"]
         if dim_power == 0:
             # Dimensionless (eccentricity) — single-unit display
-            stats_text = (
-                f"Blobs: {n_blobs:,}   |   "
-                f"Mean: {_fmtv(mean_v)}   |   "
-                f"Median: {_fmtv(median_v)}   |   "
-                f"Std: {_fmtv(std_v)}   |   "
-                f"P95: {_fmtv(p95_v)}   |   "
-                f"P99: {_fmtv(p99_v)}   |   "
-                f"Max: {_fmtv(max_v)}"
-            )
+            pairs = [
+                ("Blobs", f"{n_blobs:,}"), ("Mean", _fmtv(mean_v)),
+                ("Median", _fmtv(median_v)), ("Std", _fmtv(std_v)),
+                ("P95", _fmtv(p95_v)), ("P99", _fmtv(p99_v)),
+                ("Max", _fmtv(max_v)),
+            ]
+            stats_text = format_stats_grid(pairs, columns=4, notes=notes)
         elif factor is not None:
             def _fmtu(v):
                 return f"{v * factor:.3g}"
-            stats_text = (
-                f"Blobs: {n_blobs:,}   |   "
-                f"Mean: {_fmtv(mean_v)} {px_unit} ({_fmtu(mean_v)} {unit_label})   |   "
-                f"Median: {_fmtv(median_v)} {px_unit} ({_fmtu(median_v)} {unit_label})   |   "
-                f"Std: {_fmtv(std_v)} {px_unit} ({_fmtu(std_v)} {unit_label})   |   "
-                f"P95: {_fmtv(p95_v)} {px_unit} ({_fmtu(p95_v)} {unit_label})   |   "
-                f"P99: {_fmtv(p99_v)} {px_unit} ({_fmtu(p99_v)} {unit_label})   |   "
-                f"Max: {_fmtv(max_v)} {px_unit} ({_fmtu(max_v)} {unit_label})"
-            )
+            pairs = [("Blobs", f"{n_blobs:,}")] + [
+                (lbl, f"{_fmtv(v)} {px_unit} <span style='color:#8ab4f8;'>"
+                      f"({_fmtu(v)} {unit_label})</span>")
+                for lbl, v in (("Mean", mean_v), ("Median", median_v), ("Std", std_v),
+                               ("P95", p95_v), ("P99", p99_v), ("Max", max_v))
+            ]
             scale = self.main_app.pipeline.scale
-            stats_text += (
-                f"\nScale: {scale['px']} px = {_fmt_num(scale['value'])} {scale['unit']}   "
-                f"→  1 px = {_fmt_num(scale['value'] / scale['px'])} {scale['unit']}"
+            notes.append(
+                f"Scale: {scale['px']} px = {_fmt_num(scale['value'])} {scale['unit']}"
+                f" &nbsp;→&nbsp; 1 px = {_fmt_num(scale['value'] / scale['px'])} {scale['unit']}"
             )
+            stats_text = format_stats_grid(pairs, columns=3, notes=notes)
         else:
-            stats_text = (
-                f"Blobs: {n_blobs:,}   |   "
-                f"Mean: {_fmtv(mean_v)} {px_unit}   |   "
-                f"Median: {_fmtv(median_v)} {px_unit}   |   "
-                f"Std: {_fmtv(std_v)} {px_unit}   |   "
-                f"P95: {_fmtv(p95_v)} {px_unit}   |   "
-                f"P99: {_fmtv(p99_v)} {px_unit}   |   "
-                f"Max: {_fmtv(max_v)} {px_unit}"
-            )
-            stats_text += "\n(Set scale via Tools → Set Scale… to see physical units)"
+            pairs = [("Blobs", f"{n_blobs:,}")] + [
+                (lbl, f"{_fmtv(v)} {px_unit}")
+                for lbl, v in (("Mean", mean_v), ("Median", median_v), ("Std", std_v),
+                               ("P95", p95_v), ("P99", p99_v), ("Max", max_v))
+            ]
+            notes.append("Set a scale via Tools → Set Scale… (Ctrl+M) to see physical units.")
+            stats_text = format_stats_grid(pairs, columns=4, notes=notes)
 
         self.stats_label.setText(stats_text)
 
@@ -1054,10 +1237,18 @@ class RegionPropsWindow(QWidget):
 
 class MieComputeWorker(QThread):
     """Runs mie.analyze() off the GUI thread. The forward Mie sweep is O(num_a ·
-    n_max) and can take tens of seconds for large particles / fine grids, so it
-    must never block the UI."""
+    n_max) and can take minutes for large particles / fine grids, so it must
+    never block the UI.
+
+    Reports determinate progress and supports cooperative cancellation: the Mie
+    order loop calls back once per order (see mie.csca_curve's progress_cb), and
+    returning False there aborts the sweep. QThread.terminate() is never used —
+    killing a thread mid-numpy is a good way to corrupt the interpreter.
+    """
     finished = pyqtSignal(object)   # mie.MieResult
     error = pyqtSignal(str)
+    cancelled = pyqtSignal()
+    progress = pyqtSignal(int, int)   # orders done, orders total
 
     def __init__(self, areas_m2, n_real, n_imag, a_start, a_stop,
                  lam_nm, n_medium, mu, num_a, inversion):
@@ -1065,16 +1256,60 @@ class MieComputeWorker(QThread):
         self._args = (areas_m2, n_real, n_imag, a_start, a_stop)
         self._kw = dict(lam_nm=lam_nm, n_medium=n_medium, mu=mu, num_a=num_a,
                         inversion=inversion)
+        self._abort = False
+
+    def cancel(self):
+        self._abort = True
 
     def run(self):
         try:
             import mie
-            res = mie.analyze(*self._args, **self._kw)
+            res = mie.analyze(*self._args, progress_cb=self._on_order, **self._kw)
             self.finished.emit(res)
         except Exception as e:
+            import mie
+            if isinstance(e, mie.MieCancelled):
+                self.cancelled.emit()
+                return
             import traceback
             self.error.emit(f"{e}\n{traceback.format_exc()}")
 
+    def _on_order(self, done, total):
+        self.progress.emit(done, total)
+        return not self._abort
+
+
+class _StatCard(QFrame):
+    """Big-number readout for a headline result (D10/D50/D90 …).
+
+    The D-values are what the whole window exists to produce; before this they
+    were three numbers inside a wrapped monospace paragraph at the bottom.
+    """
+
+    def __init__(self, title: str, accent: str = "#8ab4f8"):
+        super().__init__()
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet(
+            f"QFrame {{ background:#252526; border:1px solid #3a3a3d;"
+            f" border-radius:6px; }}"
+        )
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 8)
+        lay.setSpacing(1)
+        self.title_lbl = QLabel(title)
+        self.title_lbl.setStyleSheet(
+            f"color:{accent}; font-size:11px; font-weight:600; border:none;")
+        self.value_lbl = QLabel("—")
+        self.value_lbl.setStyleSheet(
+            "color:#ececec; font-size:20px; font-weight:600; border:none;")
+        self.sub_lbl = QLabel("")
+        self.sub_lbl.setStyleSheet("color:#8a8a8a; font-size:10px; border:none;")
+        for w in (self.title_lbl, self.value_lbl, self.sub_lbl):
+            lay.addWidget(w)
+
+    def set_value(self, value: str, sub: str = ""):
+        self.value_lbl.setText(value)
+        self.sub_lbl.setText(sub)
 
 
 class MieAnalysisWindow(QWidget):
@@ -1091,84 +1326,145 @@ class MieAnalysisWindow(QWidget):
 
     Areas come from either the in-memory Region Props path (px² → m² via the
     Ctrl+M pixel scale) or a loaded CSV whose areas are already physical.
+
+    Layout is a fixed-width control column beside a plot column: the controls
+    are a numbered three-step sequence (areas → optics → sweep), so they read
+    top-to-bottom instead of as three crammed rows of unlabelled fields.
     """
+
+    # Radii are entered and displayed in µm. Metres are the storage unit
+    # (mie.py is SI throughout) but nobody sizing aerosols thinks in metres —
+    # typing 4.1924e-07 to mean "0.42 µm" is an invitation to slip a decade.
+    UM = 1e-6
 
     def __init__(self, main_app):
         super().__init__()
         self.main_app = main_app
         self.setWindowTitle("Mie Particle Sizing")
         self.setWindowFlags(Qt.WindowType.Tool)
-        self.resize(760, 680)
+        self.resize(1120, 760)
         self._worker: RegionPropsWorker | None = None
         self._mie_worker: MieComputeWorker | None = None
         self._areas_m2: np.ndarray | None = None   # particle areas (== C_sca), m²
         self._areas_source: str = ""               # human-readable provenance
         self._result = None                         # mie.MieResult
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(6)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
 
-        # --- Area source row ---
-        src_row = QHBoxLayout()
-        src_row.addWidget(QLabel("Areas from:"))
+        # ============================ left: controls ======================
+        ctrl_col = QVBoxLayout()
+        ctrl_col.setSpacing(8)
+        ctrl_host = QWidget()
+        ctrl_host.setLayout(ctrl_col)
+        ctrl_host.setFixedWidth(330)
+        root.addWidget(ctrl_host)
+
+        # --- 1. area source ---
+        src_box = QGroupBox("1 · Particle areas")
+        src_form = QFormLayout(src_box)
+        src_form.setContentsMargins(10, 6, 10, 8)
+        src_form.setSpacing(6)
         self.source_combo = QComboBox()
         self.source_combo.addItems(["Region Props (in-memory)", "CSV file"])
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
-        src_row.addWidget(self.source_combo)
-        src_row.addSpacing(8)
+        src_form.addRow("Source:", self.source_combo)
+
         self.spin_n = QSpinBox()
         self.spin_n.setRange(1, 99999)
         self.spin_n.setValue(200)
-        self.sample_lbl = QLabel("Sample frames:")
-        src_row.addWidget(self.sample_lbl)
-        src_row.addWidget(self.spin_n)
         self.all_check = QCheckBox("All frames")
         self.all_check.toggled.connect(lambda c: self.spin_n.setEnabled(not c))
-        src_row.addWidget(self.all_check)
+        frames_row = QHBoxLayout()
+        frames_row.setContentsMargins(0, 0, 0, 0)
+        frames_row.addWidget(self.spin_n)
+        frames_row.addWidget(self.all_check)
+        self.frames_row_host = QWidget()
+        self.frames_row_host.setLayout(frames_row)
+        self.sample_lbl = QLabel("Sample frames:")
+        src_form.addRow(self.sample_lbl, self.frames_row_host)
+
         self.load_csv_btn = QPushButton("Load CSV…")
-        self.load_csv_btn.setVisible(False)
         self.load_csv_btn.clicked.connect(self._load_csv)
-        src_row.addWidget(self.load_csv_btn)
         self.csv_unit_combo = QComboBox()
         self.csv_unit_combo.addItems(["mm", "µm", "m", "cm", "nm"])
-        self.csv_unit_combo.setVisible(False)
         self.csv_unit_lbl = QLabel("CSV area unit:")
-        self.csv_unit_lbl.setVisible(False)
-        src_row.addWidget(self.csv_unit_lbl)
-        src_row.addWidget(self.csv_unit_combo)
-        src_row.addStretch()
-        layout.addLayout(src_row)
+        self.csv_file_lbl = QLabel("CSV file:")
+        src_form.addRow(self.csv_file_lbl, self.load_csv_btn)
+        src_form.addRow(self.csv_unit_lbl, self.csv_unit_combo)
 
-        # --- Optical parameters row ---
-        opt_row = QHBoxLayout()
-        opt_row.addWidget(QLabel("n (real):"))
+        self.areas_lbl = QLabel("no areas loaded")
+        self.areas_lbl.setStyleSheet("color:#8a8a8a; font-size:11px;")
+        self.areas_lbl.setWordWrap(True)
+        src_form.addRow(self.areas_lbl)
+        ctrl_col.addWidget(src_box)
+
+        # --- 2. optics ---
+        opt_box = QGroupBox("2 · Optics")
+        opt_form = QFormLayout(opt_box)
+        opt_form.setContentsMargins(10, 6, 10, 8)
+        opt_form.setSpacing(6)
         self.n_real = QLineEdit("1.5")
         self.n_real.setValidator(QDoubleValidator())
-        self.n_real.setMaximumWidth(70)
-        opt_row.addWidget(self.n_real)
-        opt_row.addWidget(QLabel("n (imag):"))
         self.n_imag = QLineEdit("0.0")
         self.n_imag.setValidator(QDoubleValidator())
-        self.n_imag.setMaximumWidth(70)
-        opt_row.addWidget(self.n_imag)
-        opt_row.addWidget(QLabel("λ (nm):"))
+        n_row = QHBoxLayout()
+        n_row.setContentsMargins(0, 0, 0, 0)
+        n_row.addWidget(self.n_real)
+        n_row.addWidget(QLabel("+"))
+        n_row.addWidget(self.n_imag)
+        n_row.addWidget(QLabel("i"))
+        n_host = QWidget()
+        n_host.setLayout(n_row)
+        n_host.setToolTip(
+            "Complex refractive index of the particle.\n"
+            "Water 1.33, NaCl 1.544, glass ~1.5. Imaginary part = absorption."
+        )
+        opt_form.addRow("n particle:", n_host)
+
         self.lam = QLineEdit("527")
         self.lam.setValidator(QDoubleValidator(1.0, 1e5, 3))
-        self.lam.setMaximumWidth(70)
-        opt_row.addWidget(self.lam)
-        opt_row.addWidget(QLabel("n medium:"))
+        opt_form.addRow("λ (nm):", self.lam)
         self.n_medium = QLineEdit("1.0")
         self.n_medium.setValidator(QDoubleValidator(1e-3, 10.0, 4))
-        self.n_medium.setMaximumWidth(70)
-        opt_row.addWidget(self.n_medium)
-        opt_row.addWidget(QLabel("μ:"))
+        opt_form.addRow("n medium:", self.n_medium)
         self.mu = QLineEdit("1.0")
         self.mu.setValidator(QDoubleValidator())
-        self.mu.setMaximumWidth(60)
-        opt_row.addWidget(self.mu)
-        opt_row.addSpacing(8)
-        opt_row.addWidget(QLabel("inversion:"))
+        self.mu.setToolTip("Permeability ratio sphere/medium. Almost always 1.")
+        opt_form.addRow("μ:", self.mu)
+        ctrl_col.addWidget(opt_box)
+
+        # --- 3. radius sweep ---
+        rad_box = QGroupBox("3 · Radius sweep")
+        rad_form = QFormLayout(rad_box)
+        rad_form.setContentsMargins(10, 6, 10, 8)
+        rad_form.setSpacing(6)
+        self.a_start = QLineEdit("")
+        self.a_start.setValidator(QDoubleValidator(0.0, 1e9, 6))
+        self.a_start.setPlaceholderText("press Auto range")
+        self.a_stop = QLineEdit("")
+        self.a_stop.setValidator(QDoubleValidator(0.0, 1e9, 6))
+        self.a_stop.setPlaceholderText("press Auto range")
+        rad_form.addRow("start (µm):", self.a_start)
+        rad_form.addRow("stop (µm):", self.a_stop)
+        self.auto_btn = QPushButton("Auto range from areas")
+        self.auto_btn.setToolTip(
+            "Seed the sweep from the measured areas (geometric estimate a≈√(A/π)).\n"
+            "A tight bracket matters: runtime grows with the largest radius."
+        )
+        self.auto_btn.clicked.connect(self._auto_range)
+        rad_form.addRow(self.auto_btn)
+
+        self.num_a = QLineEdit("50000")
+        self.num_a.setValidator(QIntValidator(100, 500000))
+        self.num_a.setToolTip(
+            "Radius sweep resolution. 50000 matches the original MATLAB "
+            "(accurate but slow); lower it to trade fidelity for speed."
+        )
+        self.num_a.textChanged.connect(self._update_cost_hint)
+        rad_form.addRow("grid points:", self.num_a)
+
         self.inversion_combo = QComboBox()
         self.inversion_combo.addItem("Smoothed trend", "trend")
         self.inversion_combo.addItem("Legacy (MATLAB unique)", "legacy")
@@ -1177,98 +1473,157 @@ class MieAnalysisWindow(QWidget):
             "Legacy: original MATLAB unique() — grid-sensitive in the ripple regime,\n"
             "kept only to reproduce prior runs."
         )
-        opt_row.addWidget(self.inversion_combo)
-        opt_row.addStretch()
-        layout.addLayout(opt_row)
+        rad_form.addRow("inversion:", self.inversion_combo)
 
-        # --- Radius sweep row ---
-        rad_row = QHBoxLayout()
-        rad_row.addWidget(QLabel("Radius start (m):"))
-        self.a_start = QLineEdit("")
-        self.a_start.setValidator(QDoubleValidator(0.0, 1.0, 12))
-        self.a_start.setMaximumWidth(110)
-        rad_row.addWidget(self.a_start)
-        rad_row.addWidget(QLabel("stop (m):"))
-        self.a_stop = QLineEdit("")
-        self.a_stop.setValidator(QDoubleValidator(0.0, 1.0, 12))
-        self.a_stop.setMaximumWidth(110)
-        rad_row.addWidget(self.a_stop)
-        self.auto_btn = QPushButton("Auto range")
-        self.auto_btn.setToolTip("Seed radius range from the measured areas (geometric estimate).")
-        self.auto_btn.clicked.connect(self._auto_range)
-        rad_row.addWidget(self.auto_btn)
-        rad_row.addSpacing(8)
-        rad_row.addWidget(QLabel("grid:"))
-        self.num_a = QLineEdit("50000")
-        self.num_a.setValidator(QIntValidator(100, 500000))
-        self.num_a.setMaximumWidth(70)
-        self.num_a.setToolTip(
-            "Radius sweep resolution. 50000 matches the original MATLAB (accurate "
-            "but slow); lower it to trade fidelity for speed."
-        )
-        rad_row.addWidget(self.num_a)
-        rad_row.addStretch()
+        self.cost_lbl = QLabel("")
+        self.cost_lbl.setStyleSheet("color:#8a8a8a; font-size:10px;")
+        self.cost_lbl.setWordWrap(True)
+        rad_form.addRow(self.cost_lbl)
+        ctrl_col.addWidget(rad_box)
+
+        # --- run / cancel ---
+        run_row = QHBoxLayout()
         self.run_btn = QPushButton("Run")
+        self.run_btn.setStyleSheet(
+            "QPushButton { background:#0e639c; padding:6px; font-weight:600; }"
+            "QPushButton:hover { background:#1177bb; }"
+            "QPushButton:disabled { background:#333; color:#777; }"
+        )
         self.run_btn.clicked.connect(self._run)
-        rad_row.addWidget(self.run_btn)
+        run_row.addWidget(self.run_btn, stretch=2)
         self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setVisible(False)
+        self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._cancel)
-        rad_row.addWidget(self.cancel_btn)
-        layout.addLayout(rad_row)
+        run_row.addWidget(self.cancel_btn, stretch=1)
+        ctrl_col.addLayout(run_row)
 
-        from PyQt6.QtWidgets import QProgressBar
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
+        self.progress_bar.setTextVisible(True)
+        ctrl_col.addWidget(self.progress_bar)
 
-        # --- Plots ---
-        self.csca_plot = pg.PlotWidget()
-        self.csca_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.csca_plot.setLabel('bottom', 'radius a (m)')
-        self.csca_plot.setLabel('left', 'C_sca (m²)')
-        self.csca_plot.setLogMode(x=True, y=True)
-        layout.addWidget(self.csca_plot, stretch=1)
+        self.status_label = QLabel(
+            "Load areas, then Run. Each blob area (m²) is its scattering "
+            "cross-section C_sca. In-memory areas need a pixel scale (Ctrl+M)."
+        )
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color:#8a8a8a; font-size:11px;")
+        ctrl_col.addWidget(self.status_label)
 
-        self.cdf_plot = pg.PlotWidget()
-        self.cdf_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.cdf_plot.setLabel('bottom', 'radius a (m)')
-        self.cdf_plot.setLabel('left', 'cumulative fraction')
-        layout.addWidget(self.cdf_plot, stretch=1)
+        ctrl_col.addStretch()
 
         self.export_btn = QPushButton("Export radii CSV…")
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self._export_csv)
-        layout.addWidget(self.export_btn)
-
-        self.stats_label = QLabel(
-            "Load areas and Run. Each blob area (m²) is treated as its scattering "
-            "cross-section C_sca. In-memory areas need a pixel scale (Ctrl+M)."
-        )
-        self.stats_label.setStyleSheet("font-family: monospace; font-size: 11px;")
-        self.stats_label.setWordWrap(True)
-        layout.addWidget(self.stats_label)
+        ctrl_col.addWidget(self.export_btn)
 
         cite = QLabel(
-            "Method: Dasgupta et al., J. Flow Visualization and Image Processing "
-            "32(3), 2025."
+            "Method: Dasgupta et al., J. Flow Visualization and Image "
+            "Processing 32(3), 2025."
         )
-        cite.setStyleSheet("color: gray; font-size: 10px;")
+        cite.setStyleSheet("color: #6a6a6a; font-size: 10px;")
         cite.setWordWrap(True)
-        layout.addWidget(cite)
+        ctrl_col.addWidget(cite)
+
+        # ============================ right: results ======================
+        res_col = QVBoxLayout()
+        res_col.setSpacing(8)
+        root.addLayout(res_col, stretch=1)
+
+        cards = QHBoxLayout()
+        cards.setSpacing(8)
+        self.card_d10 = _StatCard("D10", "#6fa8ff")
+        self.card_d50 = _StatCard("D50", "#5fd08a")
+        self.card_d90 = _StatCard("D90", "#ff7b6b")
+        self.card_fit = _StatCard("Rosin-Rammler fit", "#c9a0ff")
+        for c in (self.card_d10, self.card_d50, self.card_d90, self.card_fit):
+            cards.addWidget(c)
+        res_col.addLayout(cards)
+
+        self.warn_label = QLabel("")
+        self.warn_label.setStyleSheet(
+            "color:#ffb020; font-size:11px; background:#3a2f14;"
+            " border:1px solid #6b5410; border-radius:4px; padding:5px;"
+        )
+        self.warn_label.setWordWrap(True)
+        self.warn_label.setVisible(False)
+        res_col.addWidget(self.warn_label)
+
+        self.csca_plot = pg.PlotWidget()
+        self.csca_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.csca_plot.setLabel('bottom', 'particle radius a', units='m')
+        self.csca_plot.setLabel('left', 'C_sca', units='m²')
+        self.csca_plot.setLogMode(x=True, y=True)
+        self.csca_plot.setTitle("Forward Mie curve — cross-section vs radius")
+        self.csca_legend = self.csca_plot.addLegend(offset=(-10, 10))
+        self.csca_ph = PlotPlaceholder(
+            self.csca_plot, "Forward Mie curve appears here after Run")
+        res_col.addWidget(self.csca_plot, stretch=1)
+
+        lower_row = QHBoxLayout()
+        lower_row.addWidget(QLabel("Lower plot:"))
+        self.lower_mode = QComboBox()
+        self.lower_mode.addItem("Cumulative (Rosin-Rammler)", "cdf")
+        self.lower_mode.addItem("Size distribution (histogram)", "pdf")
+        self.lower_mode.currentIndexChanged.connect(self._redraw)
+        lower_row.addWidget(self.lower_mode)
+        lower_row.addStretch()
+        res_col.addLayout(lower_row)
+
+        self.cdf_plot = pg.PlotWidget()
+        self.cdf_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.cdf_plot.setLabel('bottom', 'particle radius a', units='m')
+        self.cdf_plot.setLabel('left', 'cumulative fraction')
+        self.cdf_legend = self.cdf_plot.addLegend(offset=(-10, 10))
+        self.cdf_ph = PlotPlaceholder(
+            self.cdf_plot, "Size distribution appears here after Run")
+        res_col.addWidget(self.cdf_plot, stretch=1)
 
         self._on_source_changed()
+        self._update_cost_hint()
 
     # ------------------------------------------------------------------
+
+    def _set_status(self, text: str, kind: str = "info"):
+        """Transient status line. Separate from the result cards so an error
+        never reads as a result (they used to share one label)."""
+        colour = {"info": "#8a8a8a", "busy": "#8ab4f8",
+                  "error": "#ff7b6b", "ok": "#5fd08a"}.get(kind, "#8a8a8a")
+        self.status_label.setStyleSheet(f"color:{colour}; font-size:11px;")
+        self.status_label.setText(text)
 
     def _on_source_changed(self):
         csv = self.source_combo.currentText() == "CSV file"
         self.load_csv_btn.setVisible(csv)
+        self.csv_file_lbl.setVisible(csv)
         self.csv_unit_combo.setVisible(csv)
         self.csv_unit_lbl.setVisible(csv)
         self.sample_lbl.setVisible(not csv)
-        self.spin_n.setVisible(not csv)
-        self.all_check.setVisible(not csv)
+        self.frames_row_host.setVisible(not csv)
+
+    def _update_cost_hint(self):
+        """Show what the current grid + sweep will cost. The forward sweep is
+        O(num_a · n_max) with n_max set by the largest radius, and it is easy to
+        ask for a multi-minute run without realising it."""
+        try:
+            num_a = int(self.num_a.text())
+            a_stop = float(self.a_stop.text()) * self.UM
+            lam = float(self.lam.text()) * 1e-9
+            n_med = float(self.n_medium.text())
+        except ValueError:
+            self.cost_lbl.setText("Runtime estimate appears once the sweep is set.")
+            return
+        x_max = 2.0 * np.pi * n_med * a_stop / lam
+        n_max = int(round(2 + x_max + 4 * x_max ** (1.0 / 3.0)))
+        # ~1.4e-5 s per (grid point x order), calibrated on two measured runs of
+        # the imgs_test set: 12.4 s at 4000 points and 153.7 s at 50000, both at
+        # n_max=222. Only the order of magnitude matters — it exists so nobody
+        # starts a multi-minute sweep without being told.
+        est = num_a * n_max * 1.4e-5
+        note = "" if est < 20 else "  — lower the grid or tighten the sweep to speed this up"
+        self.cost_lbl.setText(
+            f"{n_max} Mie orders × {num_a} grid points ≈ {est:.0f} s{note}"
+        )
 
     def _load_csv(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1284,9 +1639,10 @@ class MieAnalysisWindow(QWidget):
         import mie
         factor = mie.area_unit_to_m2_factor(self.csv_unit_combo.currentText())
         self._areas_m2 = areas * factor
-        self._areas_source = f"{len(areas)} areas from {os.path.basename(path)} " \
-                             f"({self.csv_unit_combo.currentText()}²)"
-        self.stats_label.setText(f"Loaded {self._areas_source}. Set params and Run.")
+        unit = self.csv_unit_combo.currentText()
+        self._areas_source = f"{len(areas)} areas from {os.path.basename(path)} ({unit}²)"
+        self.areas_lbl.setText(f"✓ {len(areas)} areas — {os.path.basename(path)} ({unit}²)")
+        self._set_status("CSV loaded. Set optics and Run.", "ok")
         self._auto_range()
 
     @staticmethod
@@ -1323,35 +1679,38 @@ class MieAnalysisWindow(QWidget):
     def _auto_range(self):
         """Seed radius sweep from measured areas via geometric estimate a≈√(area/π)."""
         if self._areas_m2 is None or self._areas_m2.size == 0:
+            self._set_status("Load areas first — Auto range reads them.", "error")
             return
         a_geom = np.sqrt(np.clip(self._areas_m2, 0, None) / np.pi)
         a_geom = a_geom[a_geom > 0]
         if a_geom.size == 0:
             return
-        # Geometric radius already slightly over-estimates the true radius (in the
-        # optics limit C_sca→2πa², so a≈√(area/2π) < √(area/π)); a modest bracket
-        # is enough and keeps the size parameter — hence n_max and runtime — small.
+        # Geometric radius already over-estimates the true radius (in the optics
+        # limit C_sca→2πa², so a≈√(area/2π) < √(area/π)), so the upper bracket
+        # only needs a little headroom. It used to be 1.5×, which on real data
+        # pushed a_stop far past the largest particle — that inflates n_max
+        # (runtime) and leaves most of the CDF x-axis empty for no benefit.
         a_start = max(a_geom.min() * 0.5, 1e-10)
-        a_stop = a_geom.max() * 1.5
-        self.a_start.setText(f"{a_start:.4e}")
-        self.a_stop.setText(f"{a_stop:.4e}")
+        a_stop = a_geom.max() * 1.15
+        self.a_start.setText(f"{a_start / self.UM:.4g}")
+        self.a_stop.setText(f"{a_stop / self.UM:.4g}")
+        self._update_cost_hint()
 
     # --- in-memory area collection (reuses RegionPropsWorker) ----------
 
     def _collect_inmemory(self):
         app = self.main_app
         if app.sequence_manager is None:
-            self.stats_label.setText("No sequence loaded.")
+            self._set_status("No sequence loaded.", "error")
             return False
         if app.pipeline.scale is None:
-            self.stats_label.setText(
+            self._set_status(
                 "No pixel scale set. Set one via Ctrl+M (Tools → Set Scale…) so "
-                "areas can be converted to m², or switch to a CSV source."
-            )
+                "areas can be converted to m², or switch to a CSV source.", "error")
             return False
-        thresh_idx, thresh_op = app._find_op(AdaptiveThresholdOp)
+        thresh_idx, thresh_op = app._find_threshold_op()
         if thresh_op is None or not thresh_op.enabled:
-            self.stats_label.setText("No enabled AdaptiveThresholdOp in pipeline.")
+            self._set_status("No enabled threshold op in pipeline.", "error")
             return False
 
         binary_ops = [
@@ -1373,34 +1732,39 @@ class MieAnalysisWindow(QWidget):
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_areas_ready)
         self._worker.error.connect(self._on_error)
-        self.run_btn.setEnabled(False)
-        self.cancel_btn.setVisible(True)
-        self.progress_bar.setMaximum(len(sample_indices))
+        self._set_busy(True)
+        self.areas_lbl.setText(f"collecting from {len(sample_indices)} frames…")
+        self.progress_bar.setFormat("Collecting areas — frame %v of %m")
+        self.progress_bar.setRange(0, len(sample_indices))
         self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
-        self.stats_label.setText(f"Collecting areas from {len(sample_indices)} frames…")
+        self._set_status(f"Collecting areas from {len(sample_indices)} frames…", "busy")
         self._worker.start()
         return True
 
     def _on_areas_ready(self, results: dict):
         self._worker = None
-        self._set_idle()
         areas_px2 = np.asarray(results.get('area', []), dtype=float)
         if areas_px2.size == 0:
-            self.stats_label.setText("No blobs found in sampled frames.")
+            self._set_idle()
+            self._set_status("No blobs found in sampled frames.", "error")
             return
         import mie
         scale = self.main_app.pipeline.scale
         unit_per_px = scale["value"] / scale["px"]
         unit_factor = mie.area_unit_to_m2_factor(scale["unit"])
         if unit_factor is None:
-            self.stats_label.setText(
-                f"Scale unit '{scale['unit']}' not recognised (need m/cm/mm/µm/nm)."
-            )
+            self._set_idle()
+            self._set_status(
+                f"Scale unit '{scale['unit']}' not recognised (need m/cm/mm/µm/nm).",
+                "error")
             return
         # px² → (scale unit)² → m²
         self._areas_m2 = areas_px2 * (unit_per_px ** 2) * unit_factor
         self._areas_source = f"{areas_px2.size} blobs (in-memory, scale {scale['unit']})"
+        self.areas_lbl.setText(
+            f"✓ {areas_px2.size:,} blobs — scale {scale['px']:g} px = "
+            f"{scale['value']:g} {scale['unit']}".replace(",", " ")
+        )
         if not self.a_start.text() or not self.a_stop.text():
             self._auto_range()
         self._compute()
@@ -1410,7 +1774,7 @@ class MieAnalysisWindow(QWidget):
     def _run(self):
         if self.source_combo.currentText() == "CSV file":
             if self._areas_m2 is None:
-                self.stats_label.setText("Load a CSV first.")
+                self._set_status("Load a CSV first.", "error")
                 return
             self._compute()
         else:
@@ -1418,18 +1782,28 @@ class MieAnalysisWindow(QWidget):
 
     def _compute(self):
         if self._areas_m2 is None or self._areas_m2.size == 0:
-            self.stats_label.setText("No areas to analyse.")
+            self._set_idle()
+            self._set_status("No areas to analyse.", "error")
+            return
+        if not self.a_start.text() or not self.a_stop.text():
+            self._set_idle()
+            self._set_status("Radius sweep is empty — press “Auto range”.", "error")
             return
         try:
-            a_start = float(self.a_start.text())
-            a_stop = float(self.a_stop.text())
+            a_start = float(self.a_start.text()) * self.UM
+            a_stop = float(self.a_stop.text()) * self.UM
             params = dict(
                 n_real=float(self.n_real.text()), n_imag=float(self.n_imag.text()),
                 lam_nm=float(self.lam.text()), n_medium=float(self.n_medium.text()),
                 mu=float(self.mu.text()), num_a=int(self.num_a.text()),
             )
         except ValueError as e:
-            self.stats_label.setText(f"Invalid parameter: {e}")
+            self._set_idle()
+            self._set_status(f"Invalid parameter: {e}", "error")
+            return
+        if a_stop <= a_start:
+            self._set_idle()
+            self._set_status("Radius stop must be greater than start.", "error")
             return
 
         # Forward Mie is heavy — run it off the GUI thread.
@@ -1440,30 +1814,47 @@ class MieAnalysisWindow(QWidget):
         )
         self._mie_worker.finished.connect(self._on_mie_finished)
         self._mie_worker.error.connect(self._on_error)
-        self.run_btn.setEnabled(False)
-        self.progress_bar.setRange(0, 0)   # indeterminate — compute isn't chunked
-        self.progress_bar.setVisible(True)
-        self.stats_label.setText(
+        self._mie_worker.cancelled.connect(self._on_mie_cancelled)
+        self._mie_worker.progress.connect(self._on_mie_progress)
+        self._set_busy(True)
+        self.progress_bar.setFormat("Mie sweep — order %v of %m")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._set_status(
             f"Computing Mie inversion for {self._areas_m2.size} particles "
-            f"(grid {params['num_a']})…"
-        )
+            f"(grid {params['num_a']})…", "busy")
         self._mie_worker.start()
+
+    def _on_mie_progress(self, done: int, total: int):
+        if self.progress_bar.maximum() != total:
+            self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(done)
 
     def _on_mie_finished(self, res):
         self._mie_worker = None
-        self.progress_bar.setRange(0, 100)
         self._set_idle()
         self._result = res
         self.export_btn.setEnabled(True)
         self._redraw()
+
+    def _on_mie_cancelled(self):
+        self._mie_worker = None
+        self._set_idle()
+        self._set_status("Mie sweep cancelled.", "info")
 
     def _cancel(self):
         if self._worker is not None:
             self._worker.cancel()
             self._worker.wait()
             self._worker = None
-        self._set_idle()
-        self.stats_label.setText("Cancelled.")
+            self._set_idle()
+            self._set_status("Cancelled.", "info")
+        if self._mie_worker is not None:
+            # Cooperative: the order loop notices on its next callback. Never
+            # terminate() a thread sitting inside numpy.
+            self._mie_worker.cancel()
+            self._set_status("Cancelling Mie sweep…", "busy")
+            self.cancel_btn.setEnabled(False)
 
     def _on_progress(self, done: int, total: int):
         self.progress_bar.setValue(done)
@@ -1471,54 +1862,174 @@ class MieAnalysisWindow(QWidget):
     def _on_error(self, msg: str):
         self._worker = None
         self._mie_worker = None
-        self.progress_bar.setRange(0, 100)
         self._set_idle()
-        self.stats_label.setText(f"Error: {msg}")
+        self._set_status(f"Error: {msg.splitlines()[0]}", "error")
+        print(f"[Mie] {msg}")
+
+    def _set_busy(self, busy: bool):
+        self.run_btn.setEnabled(not busy)
+        self.cancel_btn.setEnabled(busy)
+        self.progress_bar.setVisible(busy)
 
     def _set_idle(self):
-        self.run_btn.setEnabled(True)
-        self.cancel_btn.setVisible(False)
-        self.progress_bar.setVisible(False)
+        self._set_busy(False)
+
+    # --- drawing --------------------------------------------------------
 
     def _redraw(self):
         res = self._result
         if res is None:
             return
-        self.csca_plot.clear()
-        self.csca_plot.plot(res.a, res.csca, pen=pg.mkPen((0, 114, 189), width=2))
+        um = lambda v: v * 1e6
 
+        # --- headline cards ---
+        src_tag = "RR fit" if res.rr_ok else "empirical"
+        for card, d in ((self.card_d10, res.D10), (self.card_d50, res.D50),
+                        (self.card_d90, res.D90)):
+            if np.isfinite(d):
+                card.set_value(f"{um(d):.3g} µm", f"{d:.3e} m · {src_tag}")
+            else:
+                card.set_value("—", "not available")
+        if res.rr_ok:
+            self.card_fit.set_value(
+                f"R² {res.r2:.4f}", f"b = {res.rr_b:.3e}   c = {res.rr_c:.3g}")
+        else:
+            self.card_fit.set_value("failed", "showing empirical percentiles")
+
+        # --- warnings the user must not miss ---
+        warns = []
+        if not res.rr_ok:
+            warns.append(
+                f"Rosin-Rammler fit did not converge (n = {res.radii.size}); "
+                f"D-values above are empirical percentiles."
+            )
+        # Radii pinned at a sweep bound mean the sweep does not cover the data.
+        r = res.radii[np.isfinite(res.radii)]
+        if r.size:
+            lo = int(np.sum(np.isclose(r, res.a[0], rtol=1e-9)))
+            hi = int(np.sum(np.isclose(r, res.a[-1], rtol=1e-9)))
+            # Advice differs by end, so report them separately. A low-end clamp
+            # is usually not a sweep problem at all: C_sca falls off as a^6 in
+            # the Rayleigh limit, so 1-2 px noise blobs land below the curve
+            # minimum no matter how the sweep is bracketed. Telling the user to
+            # widen the sweep there sends them the wrong way.
+            if lo:
+                warns.append(
+                    f"{lo} of {r.size} particles ({100.0 * lo / r.size:.0f}%) sit "
+                    f"below the curve minimum and were pinned to a_start. Blobs of "
+                    f"1-2 px scatter far less than the sweep floor, so this usually "
+                    f"means noise blobs are being sized — clean up the mask "
+                    f"(min blob area / binary smoothing) rather than widening the sweep."
+                )
+            if hi:
+                warns.append(
+                    f"{hi} of {r.size} particles ({100.0 * hi / r.size:.0f}%) exceed "
+                    f"the curve maximum and were pinned to a_stop — raise the sweep "
+                    f"stop so the largest particles are covered."
+                )
+        self.warn_label.setText("  ⚠  " + "\n  ⚠  ".join(warns) if warns else "")
+        self.warn_label.setVisible(bool(warns))
+
+        # --- C_sca curve ---
+        self.csca_plot.clear()
+        self.csca_ph.hide()
+        self.csca_legend.clear()
+        self.csca_plot.plot(res.a, res.csca, pen=pg.mkPen((90, 160, 255), width=2),
+                            name="C_sca(a)")
+        # Mark where the measured cross-sections actually sit on this curve —
+        # without it there is no way to see whether the sweep brackets the data.
+        areas = self._areas_m2
+        if areas is not None and areas.size:
+            fin = areas[np.isfinite(areas) & (areas > 0)]
+            if fin.size:
+                self.csca_plot.addItem(pg.InfiniteLine(
+                    pos=np.log10(max(fin.min(), 1e-30)), angle=0,
+                    pen=pg.mkPen((200, 200, 200), style=Qt.PenStyle.DotLine)))
+                self.csca_plot.addItem(pg.InfiniteLine(
+                    pos=np.log10(max(fin.max(), 1e-30)), angle=0,
+                    pen=pg.mkPen((200, 200, 200), style=Qt.PenStyle.DotLine)))
+                self.csca_plot.plot([], [], pen=pg.mkPen((200, 200, 200),
+                                    style=Qt.PenStyle.DotLine),
+                                    name="measured C_sca range")
+
+        # --- lower plot ---
         self.cdf_plot.clear()
+        self.cdf_ph.hide()
+        self.cdf_legend.clear()
+        mode = self.lower_mode.currentData()
+        if mode == "pdf":
+            self._draw_pdf(res)
+        else:
+            self._draw_cdf(res)
+
+        n_txt = f"{res.radii.size:,}".replace(",", " ")
+        self._set_status(
+            f"{self._areas_source} · n = {res.n_sphere} · λ = {res.lam_nm:g} nm · "
+            f"{n_txt} particles sized.", "ok")
+
+    def _d_lines(self, res):
+        """Dashed D10/D50/D90 markers, each carrying its own label. Previously
+        these were three unlabelled dashes with no legend entry."""
+        for name, d, col in (("D10", res.D10, (111, 168, 255)),
+                             ("D50", res.D50, (95, 208, 138)),
+                             ("D90", res.D90, (255, 123, 107))):
+            if not np.isfinite(d):
+                continue
+            line = pg.InfiniteLine(
+                pos=d, angle=90,
+                pen=pg.mkPen(col, width=2, style=Qt.PenStyle.DashLine),
+                label=f"{name} {d * 1e6:.2f} µm",
+                labelOpts={"color": col, "position": 0.92, "movable": False,
+                           "fill": (30, 30, 30, 200)},
+            )
+            self.cdf_plot.addItem(line)
+
+    def _draw_cdf(self, res):
+        self.cdf_plot.setLabel('left', 'cumulative fraction')
+        self.cdf_plot.setTitle("Cumulative size distribution")
         self.cdf_plot.plot(
             res.cdf_bin_centers, res.cdf_values,
-            pen=None, symbol='o', symbolSize=4,
-            symbolBrush=(150, 150, 150), name='empirical',
+            pen=None, symbol='o', symbolSize=5,
+            symbolBrush=(190, 190, 190), symbolPen=None, name='measured',
         )
         # Rosin-Rammler curve only when the fit converged (NaN params otherwise).
         if res.rr_ok and np.isfinite(res.rr_b) and np.isfinite(res.rr_c):
             a = res.a
             rr = 1.0 - np.exp(-((a / res.rr_b) ** res.rr_c))
-            self.cdf_plot.plot(a, rr, pen=pg.mkPen((217, 83, 25), width=2), name='Rosin-Rammler')
-        for d, col in ((res.D10, (0, 0, 255)), (res.D50, (0, 160, 0)), (res.D90, (255, 0, 0))):
-            if np.isfinite(d):
-                self.cdf_plot.addItem(pg.InfiniteLine(pos=d, angle=90, pen=pg.mkPen(col, style=Qt.PenStyle.DashLine)))
+            self.cdf_plot.plot(a, rr, pen=pg.mkPen((255, 140, 90), width=2),
+                               name='Rosin-Rammler fit')
+        self._d_lines(res)
+        self._fit_x_to_data(res)
 
-        def um(v):
-            return f"{v * 1e6:.3g}"
-        source = "Rosin-Rammler fit" if res.rr_ok else "empirical percentiles"
-        rr_line = (
-            f"Rosin-Rammler:  b = {res.rr_b:.3e}   c = {res.rr_c:.3g}   R² = {res.r2:.4f}"
-            if res.rr_ok else
-            f"Rosin-Rammler fit failed (n = {res.radii.size} too small / distribution too coarse) — "
-            f"showing empirical percentiles instead"
-        )
-        stats = (
-            f"{self._areas_source}   |   n = {complex(float(self.n_real.text()), float(self.n_imag.text()))}\n"
-            f"D10 = {res.D10:.3e} m ({um(res.D10)} µm)   |   "
-            f"D50 = {res.D50:.3e} m ({um(res.D50)} µm)   |   "
-            f"D90 = {res.D90:.3e} m ({um(res.D90)} µm)   [{source}]\n"
-            f"{rr_line}   (n particles = {res.radii.size})"
-        )
-        self.stats_label.setText(stats)
+    def _draw_pdf(self, res):
+        """Radius histogram. The CDF alone hides the mode and any bimodality —
+        the shape most people look for first in a spray."""
+        self.cdf_plot.setLabel('left', 'particle count')
+        self.cdf_plot.setTitle("Size distribution")
+        r = res.radii[np.isfinite(res.radii) & (res.radii > 0)]
+        if r.size == 0:
+            return
+        nbins = int(np.clip(np.sqrt(r.size), 20, 200))
+        counts, edges = np.histogram(r, bins=nbins)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        width = float(edges[1] - edges[0]) * 0.9
+        self.cdf_plot.addItem(pg.BarGraphItem(
+            x=centers, height=counts, width=width,
+            brush=(90, 160, 255, 160), pen=pg.mkPen((90, 160, 255))))
+        self.cdf_plot.plot([], [], pen=pg.mkPen((90, 160, 255), width=6),
+                           name='particle count')
+        self._d_lines(res)
+        self._fit_x_to_data(res)
+
+    def _fit_x_to_data(self, res):
+        """Frame the x-axis on the particles, not the sweep. The RR curve is
+        evaluated over the whole radius grid, which used to stretch the axis far
+        past the largest particle and leave most of the plot empty."""
+        r = res.radii[np.isfinite(res.radii) & (res.radii > 0)]
+        if r.size == 0:
+            return
+        hi = max(float(np.percentile(r, 99.9)), float(res.D90) if np.isfinite(res.D90) else 0.0)
+        self.cdf_plot.setXRange(0.0, hi * 1.08, padding=0)
 
     def _export_csv(self):
         res = self._result
@@ -1543,9 +2054,7 @@ class MieAnalysisWindow(QWidget):
         try:
             with open(path, 'w') as f:
                 f.write("\n".join(lines))
-            self.stats_label.setText(
-                self.stats_label.text() + f"\nExported {res.radii.size} radii → {path}"
-            )
+            self._set_status(f"Exported {res.radii.size} radii → {path}", "ok")
         except OSError as e:
             QMessageBox.critical(self, "Export Failed", str(e))
 
@@ -1588,6 +2097,44 @@ class ContrastToolWindow(QWidget):
         self.region.sigRegionChanged.connect(self.on_region_changed)
         self.hist_plot.addItem(self.region)
 
+        # --- histogram controls -------------------------------------------
+        # After background subtraction nearly every pixel sits near zero, so on
+        # a 0-4095 axis the data occupies the leftmost few percent and the
+        # vmin/vmax handles are pinned at the extremes — unusable without a way
+        # to zoom in or to have the range chosen for you.
+        hist_ctrl = QHBoxLayout()
+        self.auto_btn = QPushButton("Auto contrast")
+        self.auto_btn.setToolTip(
+            "Set vmin/vmax to the 0.1 - 99.9 percentile of the current frame,\n"
+            "ignoring the empty tail. Display only — pixel data is untouched."
+        )
+        self.auto_btn.clicked.connect(self.auto_contrast)
+        hist_ctrl.addWidget(self.auto_btn)
+
+        self.full_btn = QPushButton("Full range")
+        self.full_btn.setToolTip("Reset vmin/vmax to the full bit depth.")
+        self.full_btn.clicked.connect(self.full_range)
+        hist_ctrl.addWidget(self.full_btn)
+
+        self.hist_log_check = QCheckBox("Log count")
+        self.hist_log_check.setToolTip(
+            "Log-scale the histogram counts. The background peak is orders of "
+            "magnitude taller than the particle tail and flattens it otherwise."
+        )
+        self.hist_log_check.toggled.connect(self._replot_histogram)
+        hist_ctrl.addWidget(self.hist_log_check)
+
+        self.hist_zoom_check = QCheckBox("Zoom to data")
+        self.hist_zoom_check.setChecked(True)
+        self.hist_zoom_check.setToolTip(
+            "Frame the x-axis on the occupied intensity range instead of the "
+            "full bit depth."
+        )
+        self.hist_zoom_check.toggled.connect(self._replot_histogram)
+        hist_ctrl.addWidget(self.hist_zoom_check)
+        hist_ctrl.addStretch()
+        layout.addLayout(hist_ctrl)
+
         self.curve_plot = pg.PlotWidget(title="8-Bit Mapping Preview")
         self.curve_plot.setLabel('left', "Output (0-255)")
         self.curve_plot.setLabel('bottom', "Input Intensity")
@@ -1596,6 +2143,9 @@ class ContrastToolWindow(QWidget):
         self.curve_plot.setMouseEnabled(x=False, y=False)
         self.curve_plot.hideButtons()
         self.curve_plot.setYRange(-10, 265, padding=0)
+        # The mapping preview is one monotone curve; the histogram is the plot
+        # people actually work in. 3:1 instead of the old equal split.
+        self.curve_plot.setMaximumHeight(170)
         layout.addWidget(self.curve_plot)
 
         self.curve_line = self.curve_plot.plot(pen=pg.mkPen(color=(255, 200, 100), width=3))
@@ -1632,7 +2182,9 @@ class ContrastToolWindow(QWidget):
         self._updating = True
         self.region.setBounds([0, self.main_app.bit_depth_max])
         self.region.setRegion([self.main_app.vmin, self.main_app.vmax])
-        self.hist_plot.setXRange(0, self.main_app.bit_depth_max, padding=0.05)
+        # X range is owned by _draw_histogram — it honours "Zoom to data", which
+        # a hardcoded full-bit-depth range here would silently override.
+        self._draw_histogram()
         self.update_curve_preview()
         self._updating = False
 
@@ -1640,7 +2192,91 @@ class ContrastToolWindow(QWidget):
         # 4× subsample for large frames — negligible accuracy loss for display histogram
         sample = raw_frame[::2, ::2] if raw_frame.size > 262144 else raw_frame
         y, x = np.histogram(sample, bins=250, range=(0, self.main_app.bit_depth_max))
-        self.hist_curve.setData(x, y)
+        # Kept so the log/zoom toggles can re-render without re-reading a frame.
+        self._hist_x, self._hist_y = x, y
+        self._draw_histogram()
+
+    def _draw_histogram(self):
+        x, y = getattr(self, "_hist_x", None), getattr(self, "_hist_y", None)
+        if x is None or y is None:
+            return
+        if self.hist_log_check.isChecked():
+            plot_y = np.log10(y.astype(np.float64) + 1.0)
+            self.hist_plot.setLabel('left', "log₁₀(count+1)")
+        else:
+            plot_y = y
+            self.hist_plot.setLabel('left', "Pixel Count")
+        self.hist_curve.setData(x, plot_y)
+
+        if self.hist_zoom_check.isChecked():
+            lo, hi = self._occupied_range()
+            span = max(hi - lo, 1.0)
+            # Stretch to keep the vmin/vmax handles grabbable, but only so far —
+            # at the default vmax (full bit depth) an unbounded stretch would
+            # restore the very full-range view this toggle exists to escape.
+            # Beyond the margin the handle is off-screen and "Full range" /
+            # "Auto contrast" are the way back to it.
+            margin = 0.5 * span
+            lo = max(min(lo, self.main_app.vmin), lo - margin)
+            hi = min(max(hi, self.main_app.vmax), hi + margin)
+            span = max(hi - lo, 1.0)
+            self.hist_plot.setXRange(lo - 0.02 * span, hi + 0.02 * span, padding=0)
+        else:
+            self.hist_plot.setXRange(0, self.main_app.bit_depth_max, padding=0.02)
+
+    def _replot_histogram(self):
+        self._draw_histogram()
+
+    def _occupied_range(self, mass: float = 0.9995):
+        """Intensity range holding `mass` of the pixels.
+
+        Not first/last non-empty bin: a handful of hot pixels sit far out in the
+        tail, so "any pixels here" stretched the view to ~2900 for data that is
+        entirely below 300. Cumulative mass ignores that tail while still
+        covering everything the eye can see.
+        """
+        x, y = getattr(self, "_hist_x", None), getattr(self, "_hist_y", None)
+        if x is None or y is None or not y.any():
+            return 0.0, float(self.main_app.bit_depth_max)
+        c = np.cumsum(y.astype(np.float64))
+        total = c[-1]
+        if total <= 0:
+            return 0.0, float(self.main_app.bit_depth_max)
+        c /= total
+        lo_i = int(np.searchsorted(c, (1.0 - mass) / 2.0))
+        hi_i = int(np.searchsorted(c, 1.0 - (1.0 - mass) / 2.0))
+        lo_i = max(0, min(lo_i, len(x) - 2))
+        hi_i = max(lo_i + 1, min(hi_i + 1, len(x) - 1))
+        return float(x[lo_i]), float(x[hi_i])
+
+    def auto_contrast(self):
+        """vmin/vmax from the 0.1-99.9 percentile of the current frame.
+
+        Display-only, like every other control in this window — the pixel data
+        is never touched. Percentiles rather than min/max because a handful of
+        hot pixels otherwise stretch the range back to useless.
+        """
+        app = self.main_app
+        frame = app._last_frame_for_histogram
+        if frame is None:
+            frame = app.current_raw_frame
+        if frame is None:
+            return
+        sample = frame[::2, ::2] if frame.size > 262144 else frame
+        lo, hi = (float(v) for v in np.percentile(sample, [0.1, 99.9]))
+        if hi <= lo:
+            hi = lo + 1.0
+        app.vmin, app.vmax = lo, hi
+        app._display_lut = None          # force LUT rebuild
+        self.sync_from_main()
+        app.update_frame_display()
+
+    def full_range(self):
+        app = self.main_app
+        app.vmin, app.vmax = 0, app.bit_depth_max
+        app._display_lut = None
+        self.sync_from_main()
+        app.update_frame_display()
 
     def update_curve_preview(self):
         vmin, vmax = self.main_app.vmin, self.main_app.vmax
@@ -1763,10 +2399,21 @@ class IntensityWatershedParamsWidget(QWidget):
         layout = QFormLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
+        # Same reason as the generic ParamsWidget: this form has the longest
+        # labels in the app ("Invert intensity (dark particles):" at 207px), and
+        # QFormLayout sizes its label column to the widest one.
+        layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         # --- dynamic intensity-source combo ---
         self.source_combo = QComboBox()
-        self.source_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        # AdjustToContents sizes the combo to its longest entry ("Pre-threshold
+        # frame (default)"), which pushed the form wider than the params
+        # viewport and forced a horizontal scrollbar. Cap the demanded width and
+        # let the popup show the full text instead.
+        self.source_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.source_combo.setMinimumContentsLength(10)
         self.source_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._populate_source_combo()
         layout.addRow("Intensity source:", self.source_combo)
@@ -1821,6 +2468,24 @@ class IntensityWatershedParamsWidget(QWidget):
         )
         layout.addRow("Min blob area for splitting:", self.spin_min_blob_area)
 
+        # --- invert_intensity ---
+        # Peak detection finds maxima; dark-on-bright sources (shadowgraphy)
+        # need the intensity negated first.  Should match the threshold op's
+        # polarity setting.
+        self.combo_invert = QComboBox()
+        self.combo_invert.addItems(["no", "yes"])
+        self.combo_invert.setCurrentText(op.params.get("invert_intensity", "no"))
+        self.combo_invert.setToolTip(
+            "Set to 'yes' when particles are darker than the background\n"
+            "(shadowgraphy / backlit imaging).  Peak detection finds maxima,\n"
+            "so dark particle cores must be inverted to be found.\n"
+            "Match this to the threshold op's Polarity setting."
+        )
+        self.combo_invert.currentTextChanged.connect(
+            lambda v: self._emit("invert_intensity", v)
+        )
+        layout.addRow("Invert intensity (dark particles):", self.combo_invert)
+
     # ------------------------------------------------------------------
 
     def _populate_source_combo(self):
@@ -1839,11 +2504,7 @@ class IntensityWatershedParamsWidget(QWidget):
         self._source_choices = [("Pre-threshold frame (default)", -1)]
 
         pipeline = self.main_app.pipeline
-        thresh_idx = -1
-        for i, op in enumerate(pipeline.operations):
-            if isinstance(op, AdaptiveThresholdOp):
-                thresh_idx = i
-                break
+        thresh_idx, _ = self.main_app._find_threshold_op()
 
         limit = thresh_idx if thresh_idx >= 0 else len(pipeline.operations)
 
@@ -1858,7 +2519,7 @@ class IntensityWatershedParamsWidget(QWidget):
         # Only list ops after the last shape-changing op.
         for i, op in enumerate(pipeline.operations[:limit]):
             if i > last_shape_idx:
-                self._source_choices.append((f"{i}: {op.name}", i))
+                self._source_choices.append((f"{i}: {type(op).display()}", i))
 
         for label, _ in self._source_choices:
             self.source_combo.addItem(label)
@@ -1909,6 +2570,12 @@ class ParamsWidget(QWidget):
         layout = QFormLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
+        # Long labels ("Invert intensity (dark particles):") otherwise set the
+        # label-column width for the whole form, pushing its minimum width past
+        # the params viewport and forcing a horizontal scrollbar. WrapLongRows
+        # drops the field under its label instead of widening the form.
+        layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         for spec in op.params_schema:
             key = spec["key"]
@@ -1922,10 +2589,30 @@ class ParamsWidget(QWidget):
                 step = spec.get("step", 1)
                 w.setSingleStep(step)
                 w.setValue(current)
+                # keyboardTracking=False: without it every intermediate value
+                # while typing "125" fires valueChanged -> a full pipeline
+                # recompute. Now typing commits once (Enter / focus-out), while
+                # the arrows still preview live. CropParamsWidget has always
+                # used editingFinished for the same reason.
+                w.setKeyboardTracking(False)
                 w.valueChanged.connect(lambda val, k=key: self._emit(k, val))
+                # `step == 2` marks a kernel/window param that OpenCV requires to
+                # be odd. The ops defensively do `if k % 2 == 0: k += 1`, so an
+                # even entry used to leave the spinbox showing a value the op was
+                # not using. Snap on commit (editingFinished, not valueChanged —
+                # snapping mid-typing would fight the user on the first digit).
+                if step == 2:
+                    w.editingFinished.connect(
+                        lambda k=key, sb=w, lo=lo, hi=hi: self._snap_odd(k, sb, lo, hi)
+                    )
             elif widget_hint == "combo":
                 w = QComboBox()
-                w.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+                # See IntensityWatershedParamsWidget: AdjustToContents makes the
+                # combo demand its longest entry's width, which can force a
+                # horizontal scrollbar in the params panel ("bright_on_dark").
+                w.setSizeAdjustPolicy(
+                    QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+                w.setMinimumContentsLength(10)
                 w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
                 choices = spec.get("choices", [])
                 w.addItems(choices)
@@ -1937,8 +2624,31 @@ class ParamsWidget(QWidget):
             else:
                 w = QLabel(str(current))
 
+            help_text = spec.get("help")
+            if help_text:
+                w.setToolTip(help_text)
+
             self._widgets[key] = w
-            layout.addRow(spec.get("label", key) + ":", w)
+            label = QLabel(spec.get("label", key) + ":")
+            if help_text:
+                # Tooltip on the label too — users hover the name, not the box.
+                label.setToolTip(help_text)
+            layout.addRow(label, w)
+
+    def _snap_odd(self, key, spin, lo, hi):
+        """Round a committed even value up to the next odd one, in range.
+
+        Keeps the displayed value equal to the value the op actually applies.
+        Writing through setValue() re-enters _emit via valueChanged, which is
+        what we want — the params dict and the preview both follow.
+        """
+        val = spin.value()
+        if val % 2 == 1:
+            return
+        snapped = val + 1 if val + 1 <= hi else val - 1
+        if snapped < lo:
+            return
+        spin.setValue(snapped)
 
     def _emit(self, key, val):
         if self._updating:
@@ -1968,7 +2678,10 @@ class PipelinePanel(QWidget):
         super().__init__(main_app, Qt.WindowType.Tool)
         self.main_app = main_app
         self.setWindowTitle("Pipeline")
-        self.setGeometry(1150, 100, 340, 520)
+        # Taller than the old 520 so the largest params form (6 rows, for
+        # IntensityWatershedSplitOp) fits without scrolling, and wider so combo
+        # values are not clipped.
+        self.setGeometry(1150, 100, 380, 720)
         self._selected_idx = -1
 
         outer = QVBoxLayout(self)
@@ -1998,29 +2711,35 @@ class PipelinePanel(QWidget):
         self.add_btn.clicked.connect(self._on_add)
         self.remove_btn.clicked.connect(self._on_remove)
 
-        # --- display selector ---
-        disp_box = QGroupBox("Display")
-        disp_layout = QVBoxLayout(disp_box)
-        disp_layout.setSpacing(4)
-        self.base_label = QLabel("Base stage: (all)")
-        disp_layout.addWidget(self.base_label)
-        self.overlay_label = QLabel("Overlay stage: (none)")
-        disp_layout.addWidget(self.overlay_label)
-        outer.addWidget(disp_box)
+        # The old "Display" group box lived here. It was dead UI — its two
+        # labels were written once at construction and never updated, so it
+        # permanently claimed "Base stage: (all) / Overlay stage: (none)" even
+        # while the threshold overlay was rendering. Removed rather than wired
+        # up: the information is already visible in the image itself, and the
+        # ~60px it occupied is exactly what the params area was starved of.
 
         # --- params area ---
         self.params_group = QGroupBox("Stage Params")
-        self.params_group.setMinimumHeight(120)
+        self.params_group.setMinimumHeight(200)
         params_outer = QVBoxLayout(self.params_group)
         params_outer.setContentsMargins(4, 4, 4, 4)
 
         self.params_scroll = QScrollArea()
         self.params_scroll.setWidgetResizable(True)
         self.params_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        # Let the form set the viewport width so long combo values ("Pre-threshold
+        # frame (default)") don't trigger a horizontal scrollbar.
+        self.params_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         params_outer.addWidget(self.params_scroll)
         self._show_params(None)  # set initial placeholder
 
-        outer.addWidget(self.params_group)
+        # stretch=1: the params area is the only thing that should absorb spare
+        # height. Without it the group got its bare minimum (~110px) while the
+        # stage list took 160px, hiding most ops' params behind two scrollbars —
+        # AdaptiveThresholdOp's `polarity` and IntensityWatershedSplitOp's
+        # `invert_intensity` were unreachable at the default window size.
+        outer.addWidget(self.params_group, stretch=1)
 
         # --- fit / apply-all buttons ---
         action_row = QHBoxLayout()
@@ -2056,7 +2775,7 @@ class PipelinePanel(QWidget):
         pipeline = self.main_app.pipeline
         if isinstance(op, BgSubtractOp):
             return op.enabled and op._background is None
-        if isinstance(op, AdaptiveThresholdOp):
+        if getattr(op, "is_threshold_op", False):
             cache = pipeline._caches[idx] if 0 <= idx < len(pipeline._caches) else {}
             return op._batch_was_run and not bool(cache)
         return False
@@ -2065,7 +2784,7 @@ class PipelinePanel(QWidget):
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         for i, op in enumerate(self.main_app.pipeline.operations):
-            item = QListWidgetItem(op.name)
+            item = QListWidgetItem(type(op).display())
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if op.enabled else Qt.CheckState.Unchecked)
             if self._is_stale(i, op):
@@ -2209,7 +2928,10 @@ class PipelinePanel(QWidget):
         layout = QVBoxLayout(dlg)
         layout.addWidget(QLabel("Choose operation:"))
         combo = QComboBox()
-        combo.addItems(list(OPERATION_REGISTRY.keys()))
+        # Show human labels, carry the registry key as itemData — the key is the
+        # serialization name and must not leak into the UI.
+        for key, cls in sorted(OPERATION_REGISTRY.items(), key=lambda kv: kv[1].display()):
+            combo.addItem(cls.display(), key)
         layout.addWidget(combo)
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dlg.accept)
@@ -2217,7 +2939,7 @@ class PipelinePanel(QWidget):
         layout.addWidget(btns)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        cls = OPERATION_REGISTRY[combo.currentText()]
+        cls = OPERATION_REGISTRY[combo.currentData()]
         op = cls()
         insert_at = self._selected_idx + 1 if self._selected_idx >= 0 else -1
         self.main_app.pipeline.add_operation(op, at_idx=insert_at)
@@ -2258,7 +2980,7 @@ class PipelinePanel(QWidget):
         if not (0 <= idx < len(ops)):
             return
         op = ops[idx]
-        if not isinstance(op, AdaptiveThresholdOp):
+        if not getattr(op, "is_threshold_op", False):
             return
         self.main_app._run_threshold_batch(op, idx)
 
@@ -2266,8 +2988,9 @@ class PipelinePanel(QWidget):
         """Return True when Save Masks should be enabled for the current selection.
 
         Conditions:
-          1. Selected op is AdaptiveThresholdOp OR a downstream is_binary_mask_op.
-          2. AdaptiveThresholdOp exists in the pipeline with a non-empty batch cache.
+          1. Selected op is a threshold op (AdaptiveThresholdOp / GlobalThresholdOp)
+             OR a downstream is_binary_mask_op.
+          2. The active threshold op exists in the pipeline with a non-empty batch cache.
         """
         idx = self._selected_idx
         ops = self.main_app.pipeline.operations
@@ -2275,14 +2998,14 @@ class PipelinePanel(QWidget):
         if op is None:
             return False
         # Condition 1: selected op is threshold or a downstream binary-mask op
-        is_threshold = isinstance(op, AdaptiveThresholdOp)
+        is_threshold = getattr(op, "is_threshold_op", False)
         is_binary_downstream = (
             getattr(op, "is_binary_mask_op", False) and not is_threshold
         )
         if not (is_threshold or is_binary_downstream):
             return False
         # Condition 2: AdaptiveThresholdOp has a non-empty batch cache
-        thresh_idx, thresh_op = self.main_app._find_op(AdaptiveThresholdOp)
+        thresh_idx, thresh_op = self.main_app._find_threshold_op()
         if thresh_op is None:
             return False
         return bool(
@@ -2524,16 +3247,23 @@ class FacetThicknessPanel(QWidget):
 
         # --- persistence ---
         row3 = QHBoxLayout()
-        save_btn = QPushButton("Save JSON…")
-        save_btn.clicked.connect(main_app.save_facet_sessions_dialog)
-        row3.addWidget(save_btn)
-        load_btn = QPushButton("Load JSON…")
+        # Kept as attributes (not locals) so _refresh_button_states can gate
+        # them — exporting nothing is a no-op the user has to discover.
+        self.save_btn = QPushButton("Save JSON…")
+        self.save_btn.clicked.connect(main_app.save_facet_sessions_dialog)
+        row3.addWidget(self.save_btn)
+        load_btn = QPushButton("Load JSON…")     # always valid — nothing needed
         load_btn.clicked.connect(main_app.load_facet_sessions_dialog)
         row3.addWidget(load_btn)
-        csv_btn = QPushButton("Export CSV…")
-        csv_btn.clicked.connect(main_app.export_facet_csv_dialog)
-        row3.addWidget(csv_btn)
+        self.export_btn = QPushButton("Export CSV…")
+        self.export_btn.clicked.connect(main_app.export_facet_csv_dialog)
+        row3.addWidget(self.export_btn)
         outer.addLayout(row3)
+
+        self._plot_placeholder = PlotPlaceholder(
+            self.plot_widget, "Thickness vs position appears here once you\n"
+                              "finish an interface and click surface points")
+        self._refresh_button_states()
 
     # ------------------------------------------------------------------
     # Convenience
@@ -2637,8 +3367,34 @@ class FacetThicknessPanel(QWidget):
             self._refresh_summary()
             self._refresh_table()
             self._refresh_plot()
+            self._refresh_button_states()
         finally:
             self._updating = False
+
+    def _refresh_button_states(self):
+        """Gate the buttons on what actually exists.
+
+        All five used to sit enabled with no session at all — clicking them was
+        a silent no-op, which reads as a broken button rather than an
+        inapplicable one.
+        """
+        session = self.active_session()
+        has_session = session is not None
+        has_points = bool(session and (session.interface_points or session.surface_points))
+        # "Finish Interface" only means something during phase A, and the fit
+        # needs at least 2 points to define a line.
+        self.finish_btn.setEnabled(
+            has_session and session.phase == "interface"
+            and len(session.interface_points) >= 2
+        )
+        self.undo_btn.setEnabled(has_points)
+        self.clear_btn.setEnabled(has_points)
+        self.delete_btn.setEnabled(self.session_list.currentRow() >= 0 and bool(self.sessions))
+        any_measurements = any(
+            sess.interface_points and sess.surface_points for sess in self.sessions
+        )
+        self.export_btn.setEnabled(any_measurements)
+        self.save_btn.setEnabled(bool(self.sessions))
 
     def _refresh_session_list(self):
         active_idx = self.main_app.active_facet_idx
@@ -2753,6 +3509,13 @@ class FacetThicknessPanel(QWidget):
         if legend is not None:
             legend.clear()
 
+        # Hide the idle hint only once there is something to draw, otherwise an
+        # empty plot auto-ranges into a meaningless 0.1-0.9 tick grid.
+        if any(sess.visible and sess.measurements() for sess in self.sessions):
+            self._plot_placeholder.hide()
+        else:
+            self._plot_placeholder.show()
+
         unit = "px"
         symbols = ['o', 's', 't', 'd', '+', 'x']
         for i, session in enumerate(self.sessions):
@@ -2799,6 +3562,8 @@ class TiffViewerApp(QMainWindow):
         self.sequence_manager = None
         self.current_frame = 0
         self.num_frames = 0
+        # Guards the slider <-> spinbox <-> current_frame sync against feedback.
+        self._scrub_sync = False
         self.mouse_pos = None
         self.current_raw_frame = None
 
@@ -2874,10 +3639,48 @@ class TiffViewerApp(QMainWindow):
         self.glw = pg.GraphicsLayoutWidget()
         layout.addWidget(self.glw)
 
+        # --- frame scrubber ---------------------------------------------
+        # Arrow keys alone made frame 800 of 2000 an 800-keypress trip, in the
+        # one tool whose headline feature is scrubbing long sequences.
+        scrub_row = QHBoxLayout()
+        scrub_row.setContentsMargins(6, 0, 6, 0)
+        scrub_row.setSpacing(8)
+        self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+        self.frame_slider.setRange(0, 0)
+        self.frame_slider.setEnabled(False)
+        self.frame_slider.setPageStep(10)
+        self.frame_slider.setToolTip(
+            "Drag to scrub. Arrow keys step one frame; PageUp/PageDown step 10;\n"
+            "Home/End jump to the first/last frame."
+        )
+        self.frame_slider.valueChanged.connect(self._on_frame_slider)
+        scrub_row.addWidget(self.frame_slider, stretch=1)
+
+        self.frame_spin = QSpinBox()
+        self.frame_spin.setRange(1, 1)
+        self.frame_spin.setEnabled(False)
+        self.frame_spin.setPrefix("frame ")
+        self.frame_spin.setToolTip("Type a frame number to jump straight to it.")
+        self.frame_spin.setKeyboardTracking(False)   # commit on Enter / focus-out
+        self.frame_spin.valueChanged.connect(self._on_frame_spin)
+        scrub_row.addWidget(self.frame_spin)
+        layout.addLayout(scrub_row)
+
+        # Bottom bar: pixel probe on the left, active-pipeline summary on the
+        # right. Previously a single centred label that was empty unless the
+        # cursor was over the image — ~50px of permanently blank window, and no
+        # way to see which stages were live without opening the pipeline panel.
+        info_row = QHBoxLayout()
+        info_row.setContentsMargins(8, 0, 8, 0)
         self.pixel_info_label = QLabel("")
-        self.pixel_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pixel_info_label.setMinimumHeight(20)
-        layout.addWidget(self.pixel_info_label)
+        info_row.addWidget(self.pixel_info_label)
+        info_row.addStretch()
+        self.pipeline_summary_label = QLabel("")
+        self.pipeline_summary_label.setStyleSheet("color:#8a8a8a;")
+        self.pipeline_summary_label.setToolTip("Enabled pipeline stages, in order (Ctrl+P to edit).")
+        info_row.addWidget(self.pipeline_summary_label)
+        layout.addLayout(info_row)
 
         self.view_box = self.glw.addViewBox()
         self.view_box.setAspectLocked(True)
@@ -2936,6 +3739,18 @@ class TiffViewerApp(QMainWindow):
                 return i, op
         return -1, None
 
+    def _find_threshold_op(self):
+        """Return (idx, op) for the first threshold-stage op in the pipeline
+        (any op with is_threshold_op=True — AdaptiveThresholdOp or
+        GlobalThresholdOp), regardless of enabled state. Returns (-1, None)
+        if none exists. At most one such op should be enabled at a time
+        (enforced by _toggle_threshold_op); overlay/binary-chain/batch-cache
+        logic assumes a single active threshold stage."""
+        for i, op in enumerate(self.pipeline.operations):
+            if getattr(op, "is_threshold_op", False):
+                return i, op
+        return -1, None
+
     def _select_op_in_panel(self, cls):
         idx, _ = self._find_op(cls)
         if idx < 0:
@@ -2985,12 +3800,12 @@ class TiffViewerApp(QMainWindow):
 
     def _display_target_stage(self) -> int:
         """target_stage_idx for the main display image.
-        Stops before AdaptiveThresholdOp (shown as RGBA overlay, not base image)
+        Stops before the active threshold op (shown as RGBA overlay, not base image)
         and before CropOp when in crop_mode (full image shown while drawing ROI)."""
         n_ops = len(self.pipeline.operations)
         stop_at = n_ops if self.display_base_stage == -1 else self.display_base_stage + 1
 
-        thresh_idx, thresh_op = self._find_op(AdaptiveThresholdOp)
+        thresh_idx, thresh_op = self._find_threshold_op()
         if thresh_op is not None and thresh_op.enabled:
             stop_at = min(stop_at, thresh_idx)
 
@@ -3061,7 +3876,7 @@ class TiffViewerApp(QMainWindow):
     # Threshold batch runner
     # ------------------------------------------------------------------
 
-    def _run_threshold_batch(self, op: AdaptiveThresholdOp, op_idx: int):
+    def _run_threshold_batch(self, op: Operation, op_idx: int):
         if self.sequence_manager is None:
             return
 
@@ -3119,7 +3934,7 @@ class TiffViewerApp(QMainWindow):
 
     def _invalidate_threshold_caches(self):
         for i, op in enumerate(self.pipeline.operations):
-            if isinstance(op, AdaptiveThresholdOp):
+            if getattr(op, "is_threshold_op", False):
                 self.pipeline.clear_batch_cache(i)
         self.pipeline_panel.update_save_masks_btn()
         self.pipeline_panel.update_stale_colors()
@@ -3257,8 +4072,14 @@ class TiffViewerApp(QMainWindow):
         analysis_menu.addSeparator()
 
         self.threshold_action = QAction("Adaptive Threshold", self, checkable=True)
-        self.threshold_action.triggered.connect(self.toggle_threshold)
+        self.threshold_action.triggered.connect(
+            lambda checked: self._toggle_threshold_op(AdaptiveThresholdOp, self.threshold_action, checked))
         analysis_menu.addAction(self.threshold_action)
+
+        self.global_threshold_action = QAction("Global Threshold (Otsu)", self, checkable=True)
+        self.global_threshold_action.triggered.connect(
+            lambda checked: self._toggle_threshold_op(GlobalThresholdOp, self.global_threshold_action, checked))
+        analysis_menu.addAction(self.global_threshold_action)
 
         analysis_menu.addSeparator()
 
@@ -3271,6 +4092,16 @@ class TiffViewerApp(QMainWindow):
         self.binary_smooth_action.triggered.connect(
             lambda checked: self._toggle_filter(BinarySmoothOp, self.binary_smooth_action, checked))
         analysis_menu.addAction(self.binary_smooth_action)
+
+        self.blob_size_filter_action = QAction("Blob Size Filter (mask)", self, checkable=True)
+        self.blob_size_filter_action.setToolTip(
+            "Drop connected blobs outside an area range.\n"
+            "Area-exact: surviving blobs are copied pixel-for-pixel, unlike\n"
+            "morphological opening which erodes what it keeps."
+        )
+        self.blob_size_filter_action.triggered.connect(
+            lambda checked: self._toggle_filter(BlobSizeFilterOp, self.blob_size_filter_action, checked))
+        analysis_menu.addAction(self.blob_size_filter_action)
 
         self.watershed_action = QAction("Watershed Split (mask)", self, checkable=True)
         self.watershed_action.triggered.connect(
@@ -3364,6 +4195,98 @@ class TiffViewerApp(QMainWindow):
         facet_start_action.setShortcut("Ctrl+Shift+A")
         facet_start_action.triggered.connect(self._facet_start_or_resume)
         tools_menu.addAction(facet_start_action)
+
+        help_menu = menu_bar.addMenu("Help")
+        shortcuts_action = QAction("Keyboard Shortcuts…", self)
+        shortcuts_action.setShortcut("F1")
+        shortcuts_action.triggered.connect(self.show_shortcuts_dialog)
+        help_menu.addAction(shortcuts_action)
+        about_action = QAction("About tiffscope", self)
+        about_action.triggered.connect(self.show_about_dialog)
+        help_menu.addAction(about_action)
+
+    # ------------------------------------------------------------------
+    # Help
+    # ------------------------------------------------------------------
+
+    # Single source for the in-app shortcut list. Keep in sync with README.
+    SHORTCUTS = [
+        ("Navigation", [
+            ("← / →", "Previous / next frame"),
+            ("PageUp / PageDown", "Jump 10 frames"),
+            ("Home / End", "First / last frame"),
+            ("Ctrl+O", "Open sequence"),
+        ]),
+        ("View", [
+            ("Ctrl+T", "Contrast & histogram"),
+            ("Ctrl+F", "Optical flow overlay"),
+            ("Ctrl+R", "Rotate 90° CW"),
+            ("Ctrl+0", "Reset zoom / pan"),
+            ("Ctrl++ / Ctrl+-", "Zoom in / out"),
+        ]),
+        ("Pipeline & analysis", [
+            ("Ctrl+P", "Pipeline panel"),
+            ("Ctrl+Shift+M", "Performance monitor"),
+            ("Ctrl+Shift+C", "Toggle crop mode"),
+            ("Ctrl+Shift+X", "Clear crop"),
+            ("Enter / Esc", "Confirm / cancel ROI"),
+        ]),
+        ("Measurement", [
+            ("Ctrl+M", "Set pixel scale"),
+            ("H / V", "Place horizontal / vertical ray"),
+            ("Ctrl+Shift+P", "Facet thickness panel"),
+            ("Ctrl+Shift+A", "Start / resume facet clicking"),
+        ]),
+    ]
+
+    def _refresh_pipeline_summary(self):
+        """Right-hand bottom-bar text: enabled stages in order."""
+        ops = [op for op in self.pipeline.operations if op.enabled]
+        if not ops:
+            self.pipeline_summary_label.setText("Pipeline: (none)")
+            return
+        names = " → ".join(type(op).display() for op in ops)
+        n_off = len(self.pipeline.operations) - len(ops)
+        suffix = f"   ({n_off} disabled)" if n_off else ""
+        self.pipeline_summary_label.setText(f"Pipeline: {names}{suffix}")
+
+    def show_shortcuts_dialog(self):
+        rows = []
+        for section, items in self.SHORTCUTS:
+            rows.append(
+                f'<tr><td colspan="2" style="padding:10px 0 3px 0; color:#8ab4f8;'
+                f' font-weight:600;">{section}</td></tr>'
+            )
+            for keys, desc in items:
+                rows.append(
+                    f'<tr><td style="padding:1px 18px 1px 0; white-space:nowrap;">'
+                    f'<code>{keys}</code></td>'
+                    f'<td style="padding:1px 0;">{desc}</td></tr>'
+                )
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Keyboard Shortcuts")
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel(f'<table style="border-collapse:collapse;">{"".join(rows)}</table>')
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(lbl)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        lay.addWidget(btns)
+        dlg.exec()
+
+    def show_about_dialog(self):
+        QMessageBox.about(
+            self, "About tiffscope",
+            "<b>tiffscope</b><br>"
+            "Fast scrubbing viewer and preprocessing pipeline for scientific "
+            "TIFF image sequences.<br><br>"
+            "MIT licensed &middot; "
+            "<a href='https://github.com/tiffscope/tiffscope'>"
+            "github.com/tiffscope/tiffscope</a><br><br>"
+            "Mie particle sizing method: Dasgupta et al., <i>J. Flow "
+            "Visualization and Image Processing</i> 32(3), 2025."
+        )
 
     # ------------------------------------------------------------------
     # Legacy Analysis menu shims (delegate to pipeline ops)
@@ -3560,6 +4483,8 @@ class TiffViewerApp(QMainWindow):
         if not hasattr(self, 'clahe_action'):
             return
         for cls, action in [
+            (AdaptiveThresholdOp, self.threshold_action),
+            (GlobalThresholdOp, self.global_threshold_action),
             (CLAHEOp, self.clahe_action),
             (GaussianBlurOp, self.gaussian_action),
             (SharpenOp, self.sharpen_action),
@@ -3568,6 +4493,7 @@ class TiffViewerApp(QMainWindow):
             (RollingBallBgOp, self.rollingball_action),
             (MorphologyOp, self.morphology_action),
             (BinarySmoothOp, self.binary_smooth_action),
+            (BlobSizeFilterOp, self.blob_size_filter_action),
             (WatershedSplitOp, self.watershed_action),
             (IntensityWatershedSplitOp, self.intensity_watershed_action),
         ]:
@@ -3591,22 +4517,34 @@ class TiffViewerApp(QMainWindow):
                 self.pipeline_panel.rebuild_list()
         self.update_frame_display()
 
-    def toggle_threshold(self, checked):
+    def _toggle_threshold_op(self, cls, action, checked):
+        """Like _toggle_filter, but for threshold-stage ops (AdaptiveThresholdOp /
+        GlobalThresholdOp). Enabling one disables any other threshold op first —
+        overlay/binary-chain/batch-cache logic assumes a single active threshold
+        stage (see _find_threshold_op)."""
         if checked:
-            _, op = self._ensure_op(AdaptiveThresholdOp)
+            for other_cls in (AdaptiveThresholdOp, GlobalThresholdOp):
+                if other_cls is cls:
+                    continue
+                other_idx, other_op = self._find_op(other_cls)
+                if other_op is not None and other_op.enabled:
+                    other_op.enabled = False
+                    self.pipeline._invalidate_from(other_idx)
+            _, op = self._ensure_op(cls)
             op.enabled = True
             self.pipeline_panel.rebuild_list()
-            self._select_op_in_panel(AdaptiveThresholdOp)
+            self._select_op_in_panel(cls)
         else:
-            idx, op = self._find_op(AdaptiveThresholdOp)
+            idx, op = self._find_op(cls)
             if op is not None:
                 op.enabled = False
                 self.pipeline._invalidate_from(idx)
                 self.pipeline_panel.rebuild_list()
+        self._sync_filter_menu_actions()
         self.update_frame_display()
 
     def save_threshold_masks(self):
-        idx, op = self._find_op(AdaptiveThresholdOp)
+        idx, op = self._find_threshold_op()
         if op is None or not self.pipeline._caches[idx]:
             return
 
@@ -4650,14 +5588,17 @@ class TiffViewerApp(QMainWindow):
 
             # threshold overlay
             with self.perf.span("threshold_overlay (total)"):
-                thresh_idx, thresh_op = self._find_op(AdaptiveThresholdOp)
+                thresh_idx, thresh_op = self._find_threshold_op()
                 if thresh_op is not None and thresh_op.enabled:
                     cached = self.pipeline.get_batch_cache(thresh_idx, self.current_frame)
                     if cached is not None:
                         mask = cached
                     else:
-                        # display_frame already stops before AdaptiveThresholdOp
-                        with self.perf.span("  AdaptiveThresholdOp (live)"):
+                        # display_frame already stops before the threshold op.
+                        # Label from the actual op — this span used to be the
+                        # literal "AdaptiveThresholdOp" and mislabelled every
+                        # GlobalThresholdOp run.
+                        with self.perf.span(f"  {type(thresh_op).display()} (live)"):
                             mask = thresh_op.apply(display_frame)
                     # Apply any downstream binary-mask ops (morphology, smoothing) live.
                     # They're cheap per-frame; no batch cache needed.
@@ -4780,6 +5721,7 @@ class TiffViewerApp(QMainWindow):
                 self._refresh_status_label()
             with self.perf.span("pixel_info"):
                 self.update_pixel_info()
+                self._refresh_pipeline_summary()
             if self.tool_window.isVisible():
                 with self.perf.span("histogram"):
                     self.tool_window.update_histogram(self._last_frame_for_histogram)
@@ -4931,6 +5873,7 @@ class TiffViewerApp(QMainWindow):
                     action.setChecked(target in action.text())
                 self.tool_window.sync_from_main()
 
+            self._sync_scrubber()
             self.update_frame_display()
             self.view_box.autoRange()
 
@@ -5031,14 +5974,70 @@ class TiffViewerApp(QMainWindow):
         if self.sequence_manager is None:
             return
 
-        if event.key() == Qt.Key.Key_Right:
-            if self.current_frame < self.num_frames - 1:
-                self.current_frame += 1
-                self.update_frame_display()
-        elif event.key() == Qt.Key.Key_Left:
-            if self.current_frame > 0:
-                self.current_frame -= 1
-                self.update_frame_display()
+        # All frame navigation goes through _goto_frame so the slider and the
+        # spinbox stay in sync no matter which route the user took.
+        key = event.key()
+        if key == Qt.Key.Key_Right:
+            self._goto_frame(self.current_frame + 1)
+        elif key == Qt.Key.Key_Left:
+            self._goto_frame(self.current_frame - 1)
+        elif key == Qt.Key.Key_PageDown:
+            self._goto_frame(self.current_frame + 10)
+        elif key == Qt.Key.Key_PageUp:
+            self._goto_frame(self.current_frame - 10)
+        elif key == Qt.Key.Key_Home:
+            self._goto_frame(0)
+        elif key == Qt.Key.Key_End:
+            self._goto_frame(self.num_frames - 1)
+
+    # ------------------------------------------------------------------
+    # Frame navigation
+    # ------------------------------------------------------------------
+
+    def _goto_frame(self, idx: int):
+        """Single entry point for frame changes (keys, slider, spinbox).
+
+        Clamps, redraws, and mirrors the new index into both scrubber widgets.
+        `_scrub_sync` breaks the feedback loop: setValue() on either widget
+        emits valueChanged, which would call back in here and re-render.
+        """
+        if self.sequence_manager is None:
+            return
+        idx = max(0, min(int(idx), self.num_frames - 1))
+        if idx == self.current_frame:
+            return
+        self.current_frame = idx
+        self._sync_scrubber()
+        self.update_frame_display()
+
+    def _sync_scrubber(self):
+        """Push current_frame into the slider + spinbox without re-triggering."""
+        if self._scrub_sync:
+            return
+        self._scrub_sync = True
+        try:
+            n = self.num_frames if self.sequence_manager is not None else 0
+            has_seq = n > 0
+            self.frame_slider.setEnabled(has_seq and n > 1)
+            self.frame_spin.setEnabled(has_seq)
+            if has_seq:
+                self.frame_slider.setRange(0, n - 1)
+                self.frame_spin.setRange(1, n)
+                self.frame_spin.setSuffix(f" / {n}")
+                self.frame_slider.setValue(self.current_frame)
+                self.frame_spin.setValue(self.current_frame + 1)   # 1-based for humans
+        finally:
+            self._scrub_sync = False
+
+    def _on_frame_slider(self, value: int):
+        if self._scrub_sync:
+            return
+        self._goto_frame(value)
+
+    def _on_frame_spin(self, value: int):
+        if self._scrub_sync:
+            return
+        self._goto_frame(value - 1)   # spinbox is 1-based
 
     # ------------------------------------------------------------------
     # Event filter (crop draw + ray placement)

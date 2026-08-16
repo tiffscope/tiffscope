@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 from abc import ABC, abstractmethod
 
 import cv2
@@ -8,9 +9,23 @@ import numpy as np
 
 class Operation(ABC):
     name: str = ""
+    # Human-readable label for the GUI. `name` is the serialization key and must
+    # stay stable in saved pipelines, so it cannot double as the display string —
+    # showing "AdaptiveThresholdOp" in a stage list is a leaked implementation
+    # detail. Subclasses set this; `display()` falls back to a prettified `name`.
+    display_name: str = ""
     temporal_radius: int = 0
     supports_batch_cache: bool = False
     params_schema: list = []
+
+    @classmethod
+    def display(cls) -> str:
+        """Label for the GUI: `display_name`, else `name` minus the Op suffix
+        with spaces inserted at word boundaries ("LowPassOp" -> "Low Pass")."""
+        if cls.display_name:
+            return cls.display_name
+        base = cls.name[:-2] if cls.name.endswith("Op") else cls.name
+        return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", base) or cls.name
 
     def __init__(self):
         self.params: dict = {p["key"]: p["default"] for p in self.params_schema}
@@ -79,6 +94,7 @@ class Operation(ABC):
 
 class RotateOp(Operation):
     name = "RotateOp"
+    display_name = "Rotate"
     params_schema = [
         {"key": "k", "type": "int", "default": 1, "range": [0, 3], "label": "Turns CW", "widget": "spinbox"},
     ]
@@ -97,6 +113,7 @@ class RotateOp(Operation):
 
 class CropOp(Operation):
     name = "CropOp"
+    display_name = "Crop"
     params_schema = [
         {"key": "x", "type": "int", "default": 0, "range": [0, 99999], "label": "X", "widget": "spinbox"},
         {"key": "y", "type": "int", "default": 0, "range": [0, 99999], "label": "Y", "widget": "spinbox"},
@@ -120,10 +137,12 @@ class CropOp(Operation):
 
 class BgSubtractOp(Operation):
     name = "BgSubtractOp"
+    display_name = "Background Subtract (temporal)"
     params_schema = [
         {"key": "method", "type": "str", "default": "median", "choices": ["median", "mean"],
          "label": "Method", "widget": "combo"},
         {"key": "sample_n", "type": "int", "default": 50, "range": [2, 9999],
+         "help": "How many frames are read from disk to build the background. More is cleaner but slower, and costs RAM.",
          "label": "Frames to sample", "widget": "spinbox"},
     ]
 
@@ -214,16 +233,31 @@ class BgSubtractOp(Operation):
 
 class AdaptiveThresholdOp(Operation):
     name = "AdaptiveThresholdOp"
+    display_name = "Adaptive Threshold"
     supports_batch_cache = True
+    is_threshold_op = True
     params_schema = [
         {"key": "method", "type": "str", "default": "gaussian",
          "choices": ["gaussian", "mean"], "label": "Method", "widget": "combo"},
         {"key": "block_size", "type": "int", "default": 11, "range": [3, 501],
-         "label": "Block size (odd)", "widget": "spinbox"},
+         "label": "Block size (odd)", "widget": "spinbox", "step": 2,
+         "help": "Side of the local window (px) whose mean/gaussian sets each "
+                 "pixel's threshold. Must be odd. Should comfortably exceed "
+                 "your particle size."},
         {"key": "C", "type": "int", "default": 2, "range": [-50, 50],
-         "label": "C", "widget": "spinbox"},
+         "label": "C", "widget": "spinbox",
+         "help": "Constant subtracted from the local mean. Raise it to keep only "
+                 "clearly-brighter pixels (fewer, smaller blobs); negative is "
+                 "more permissive."},
         {"key": "blur_size", "type": "int", "default": 1, "range": [1, 51],
-         "label": "Blur kernel (1=off)", "widget": "spinbox"},
+         "label": "Blur kernel (1=off)", "widget": "spinbox", "step": 2},
+        # bright_on_dark: particles brighter than background (fluorescence, PIV
+        # scattering).  dark_on_bright: particles darker than background
+        # (shadowgraphy, backlit droplets).  Only flips which side of the
+        # threshold becomes 255 — the mask is always 255 = particle.
+        {"key": "polarity", "type": "str", "default": "bright_on_dark",
+         "choices": ["bright_on_dark", "dark_on_bright"],
+         "label": "Polarity", "widget": "combo"},
     ]
 
     def __init__(self):
@@ -238,6 +272,9 @@ class AdaptiveThresholdOp(Operation):
         method_str = self.params["method"]
         cv_method = (cv2.ADAPTIVE_THRESH_GAUSSIAN_C if method_str == "gaussian"
                      else cv2.ADAPTIVE_THRESH_MEAN_C)
+        thresh_type = (cv2.THRESH_BINARY_INV
+                       if self.params.get("polarity") == "dark_on_bright"
+                       else cv2.THRESH_BINARY)
         block_size = self.params["block_size"]
         if block_size % 2 == 0:
             block_size += 1
@@ -262,7 +299,74 @@ class AdaptiveThresholdOp(Operation):
             k = blur_size if blur_size % 2 == 1 else blur_size + 1
             u8 = cv2.GaussianBlur(u8, (k, k), 0)
 
-        mask = cv2.adaptiveThreshold(u8, 255, cv_method, cv2.THRESH_BINARY, block_size, C)
+        mask = cv2.adaptiveThreshold(u8, 255, cv_method, thresh_type, block_size, C)
+        return mask
+
+
+class GlobalThresholdOp(Operation):
+    """Single threshold value for the whole frame (not per-pixel like
+    AdaptiveThresholdOp). ``is_threshold_op = True`` marks it as an
+    alternative threshold stage — the GUI treats any op with that flag
+    as *the* threshold stage (overlay, binary chain anchor, batch cache,
+    save-masks), so at most one such op should be enabled at a time."""
+    name = "GlobalThresholdOp"
+    display_name = "Global Threshold (Otsu / manual)"
+    supports_batch_cache = True
+    is_threshold_op = True
+    params_schema = [
+        {"key": "method", "type": "str", "default": "otsu",
+         "choices": ["otsu", "manual"], "label": "Method", "widget": "combo"},
+        {"key": "value", "type": "int", "default": 128, "range": [0, 255],
+         "label": "Threshold value (manual)", "widget": "spinbox"},
+        {"key": "blur_size", "type": "int", "default": 1, "range": [1, 51],
+         "label": "Blur kernel (1=off)", "widget": "spinbox", "step": 2},
+        # See AdaptiveThresholdOp.polarity.  dark_on_bright is the shadowgraphy
+        # case: backlit particles appear as dark blobs on a bright field.
+        # Otsu picks the same split value either way; only the assignment flips.
+        {"key": "polarity", "type": "str", "default": "bright_on_dark",
+         "choices": ["bright_on_dark", "dark_on_bright"],
+         "label": "Polarity", "widget": "combo"},
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self._batch_was_run: bool = False
+
+    @property
+    def output_dtype(self) -> str:
+        return "uint8"
+
+    def apply(self, frame: np.ndarray, context=None) -> np.ndarray:
+        method_str = self.params["method"]
+        blur_size = self.params["blur_size"]
+
+        # Same defensive contiguity fix as AdaptiveThresholdOp.
+        frame = np.ascontiguousarray(frame)
+
+        d = frame.astype(np.float32)
+        lo, hi = d.min(), d.max()
+        if hi > lo:
+            d -= lo
+            d *= 255.0 / (hi - lo)
+            u8 = d.astype(np.uint8)
+        else:
+            u8 = np.zeros(frame.shape, dtype=np.uint8)
+
+        if blur_size > 1:
+            k = blur_size if blur_size % 2 == 1 else blur_size + 1
+            u8 = cv2.GaussianBlur(u8, (k, k), 0)
+
+        thresh_type = (cv2.THRESH_BINARY_INV
+                       if self.params.get("polarity") == "dark_on_bright"
+                       else cv2.THRESH_BINARY)
+
+        if method_str == "otsu":
+            # Otsu picks the value minimizing intra-class intensity variance —
+            # the classic automatic global threshold.
+            _, mask = cv2.threshold(u8, 0, 255, thresh_type + cv2.THRESH_OTSU)
+        else:
+            value = self.params["value"]
+            _, mask = cv2.threshold(u8, value, 255, thresh_type)
         return mask
 
 
@@ -298,6 +402,7 @@ class RollingBallBgOp(Operation):
     """
 
     name = "RollingBallBgOp"
+    display_name = "Rolling Ball Background (per-frame)"
     params_schema = [
         {"key": "method", "type": "str", "default": "opening",
          "choices": ["opening", "rolling_ball"], "label": "Method", "widget": "combo"},
@@ -364,6 +469,7 @@ class RollingBallBgOp(Operation):
 
 class CLAHEOp(Operation):
     name = "CLAHEOp"
+    display_name = "CLAHE (local contrast)"
     params_schema = [
         {"key": "clip_limit", "type": "int", "default": 2, "range": [1, 40],
          "label": "Clip limit", "widget": "spinbox"},
@@ -403,6 +509,7 @@ class CLAHEOp(Operation):
 
 class GaussianBlurOp(Operation):
     name = "GaussianBlurOp"
+    display_name = "Gaussian Blur"
     params_schema = [
         {"key": "kernel_size", "type": "int", "default": 3, "range": [3, 51],
          "label": "Kernel size (odd)", "widget": "spinbox", "step": 2},
@@ -421,6 +528,7 @@ class GaussianBlurOp(Operation):
 
 class SharpenOp(Operation):
     name = "SharpenOp"
+    display_name = "Sharpen (unsharp mask)"
     params_schema = [
         {"key": "amount", "type": "int", "default": 1, "range": [1, 10],
          "label": "Amount (×0.5)", "widget": "spinbox"},
@@ -447,6 +555,7 @@ class SharpenOp(Operation):
 
 class LowPassOp(Operation):
     name = "LowPassOp"
+    display_name = "Low Pass (box blur)"
     params_schema = [
         {"key": "kernel_size", "type": "int", "default": 15, "range": [3, 151],
          "label": "Kernel size (odd)", "widget": "spinbox", "step": 2},
@@ -462,6 +571,7 @@ class LowPassOp(Operation):
 
 class HighPassOp(Operation):
     name = "HighPassOp"
+    display_name = "High Pass"
     params_schema = [
         {"key": "kernel_size", "type": "int", "default": 15, "range": [3, 151],
          "label": "Kernel size (odd)", "widget": "spinbox", "step": 2},
@@ -502,6 +612,7 @@ _MORPH_OP_MAP = {
 
 class MorphologyOp(Operation):
     name = "MorphologyOp"
+    display_name = "Morphology (mask)"
     is_binary_mask_op = True
     params_schema = [
         {"key": "operation", "type": "str", "default": "open",
@@ -542,6 +653,7 @@ class MorphologyOp(Operation):
 
 class BinarySmoothOp(Operation):
     name = "BinarySmoothOp"
+    display_name = "Binary Smooth (mask)"
     is_binary_mask_op = True
     params_schema = [
         {"key": "kernel_size", "type": "int", "default": 3, "range": [3, 15],
@@ -564,8 +676,75 @@ class BinarySmoothOp(Operation):
         return cv2.medianBlur(frame, k)
 
 
+class BlobSizeFilterOp(Operation):
+    """Remove connected components outside an area range.
+
+    The size criterion the other binary ops only approximate:
+
+      - ``MorphologyOp`` (open) filters by kernel *geometry*, not area, and
+        erodes the blobs it keeps — fatal when the blob's area is itself the
+        measurement (Mie sizing reads area as the scattering cross-section).
+      - ``BinarySmoothOp`` (median) removes isolated speckle by neighbourhood
+        vote; a compact 3-4 px cluster outvotes the kernel and survives.
+      - ``IntensityWatershedSplitOp.min_blob_area`` *copies* small blobs through
+        untouched — it only skips peak detection on them.
+
+    This op is area-exact in both directions: surviving blobs are copied
+    pixel-for-pixel, so downstream area/regionprops/Mie numbers are unchanged
+    for everything that passes.
+    """
+    name = "BlobSizeFilterOp"
+    display_name = "Blob Size Filter (mask)"
+    is_binary_mask_op = True
+    params_schema = [
+        {"key": "min_area", "type": "int", "default": 4, "range": [0, 1000000],
+         "help": "Blobs smaller than this are deleted. 0 disables. Use Blob Size Analysis to find where noise ends and particles begin.",
+         "label": "Min blob area (px², 0=off)", "widget": "spinbox"},
+        # 0 = no upper limit. Useful for dropping merged clumps or agglomerates
+        # that would otherwise be sized as one huge particle.
+        {"key": "max_area", "type": "int", "default": 0, "range": [0, 1000000],
+         "help": "Blobs larger than this are deleted. 0 disables. Useful for dropping merged clumps.",
+         "label": "Max blob area (px², 0=off)", "widget": "spinbox"},
+        {"key": "connectivity", "type": "str", "default": "8",
+         "choices": ["8", "4"], "label": "Connectivity", "widget": "combo"},
+    ]
+
+    @property
+    def input_requirements(self) -> dict:
+        return {"ndim": 2, "dtypes": ["uint8"]}
+
+    @property
+    def output_dtype(self) -> str:
+        return "uint8"
+
+    def apply(self, frame: np.ndarray, context=None) -> np.ndarray:
+        frame = np.ascontiguousarray(frame)
+        min_area = int(self.params.get("min_area", 0))
+        max_area = int(self.params.get("max_area", 0))
+        if min_area <= 0 and max_area <= 0:
+            return frame
+
+        conn = 4 if str(self.params.get("connectivity", "8")) == "4" else 8
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(frame, connectivity=conn)
+        if n <= 1:
+            return frame
+
+        areas = stats[:, cv2.CC_STAT_AREA]
+        keep = np.ones(n, dtype=bool)
+        if min_area > 0:
+            keep &= areas >= min_area
+        if max_area > 0:
+            keep &= areas <= max_area
+        keep[0] = False                      # label 0 is background
+
+        # Index the per-label keep table with the label image — one pass, no
+        # per-blob Python loop (frames here carry thousands of blobs).
+        return np.where(keep[labels], np.uint8(255), np.uint8(0))
+
+
 class WatershedSplitOp(Operation):
     name = "WatershedSplitOp"
+    display_name = "Watershed Split (mask)"
     is_binary_mask_op = True
     params_schema = [
         {"key": "min_peak_distance", "type": "int", "default": 5, "range": [1, 50],
@@ -643,6 +822,7 @@ class IntensityWatershedSplitOp(Operation):
     """
 
     name = "IntensityWatershedSplitOp"
+    display_name = "Intensity Watershed Split (mask)"
     is_binary_mask_op = True
     requires_intensity_context = True
 
@@ -665,12 +845,20 @@ class IntensityWatershedSplitOp(Operation):
          "label": "Min peak intensity (0-255)", "widget": "spinbox"},
         # radius_scale: percentage of area-derived radius to draw; 100 = exact area-preserving
         {"key": "radius_scale", "type": "int", "default": 100, "range": [50, 200],
+         "help": "Scales each reconstructed circle relative to its area-preserving radius. 100 % keeps the measured area; lower it if split circles overlap.",
          "label": "Radius scale (%)", "widget": "spinbox"},
         # min_blob_area: blobs smaller than this are copied unchanged (no peak detection).
         # Primary performance lever — skips skimage.peak_local_max for the many
         # small single-particle blobs that can never be merged particles.
         {"key": "min_blob_area", "type": "int", "default": 50, "range": [1, 100000],
          "label": "Min blob area for splitting (px²)", "widget": "spinbox"},
+        # Peak detection finds *maxima*.  For dark-on-bright sources
+        # (shadowgraphy) particle cores are intensity minima, so the raw
+        # intensity must be negated first or peaks land on the bright halo
+        # instead of the particle.  Match this to the threshold op's polarity.
+        {"key": "invert_intensity", "type": "str", "default": "no",
+         "choices": ["no", "yes"],
+         "label": "Invert intensity (dark particles)", "widget": "combo"},
     ]
 
     @property
@@ -701,6 +889,12 @@ class IntensityWatershedSplitOp(Operation):
             return frame
 
         intensity_raw = np.ascontiguousarray(intensity_raw.astype(np.float32))
+
+        # Dark-on-bright (shadowgraphy): particle cores are minima.  Negating
+        # here turns them into maxima; the per-blob [min,max]→[0,255] rescale
+        # below absorbs the resulting offset, so nothing downstream changes.
+        if self.params.get("invert_intensity") == "yes":
+            intensity_raw = -intensity_raw
 
         min_dist = max(1, int(self.params["min_peak_distance"]))
         threshold = float(self.params["threshold_abs"])
@@ -829,8 +1023,8 @@ class IntensityWatershedSplitOp(Operation):
 OPERATION_REGISTRY: dict[str, type[Operation]] = {
     cls.name: cls
     for cls in [RotateOp, CropOp, BgSubtractOp, RollingBallBgOp, AdaptiveThresholdOp,
-                CLAHEOp, GaussianBlurOp, SharpenOp, LowPassOp, HighPassOp,
-                MorphologyOp, BinarySmoothOp, WatershedSplitOp,
+                GlobalThresholdOp, CLAHEOp, GaussianBlurOp, SharpenOp, LowPassOp, HighPassOp,
+                MorphologyOp, BinarySmoothOp, BlobSizeFilterOp, WatershedSplitOp,
                 IntensityWatershedSplitOp]
 }
 

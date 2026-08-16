@@ -2,38 +2,32 @@
 
 **Fast scrubbing viewer and preprocessing pipeline for scientific TIFF image sequences.**
 
-Built for looking at *thousands* of frames quickly: high-speed camera output, PIV/PTV particle images, SEM series, time-lapse microscopy — anything that lands on disk as a folder of grayscale TIFFs. Scrub with arrow keys at interactive speed, build a non-destructive processing pipeline, and export binary masks ready for downstream analysis.
+Built for looking at *thousands* of frames quickly: high-speed camera output, PIV/PTV particle images, SEM series, time-lapse microscopy — anything that lands on disk as a folder of grayscale TIFFs. Scrub at interactive speed, build a non-destructive processing pipeline, and export binary masks ready for downstream analysis.
 
-![tiffscope demo](docs/demo.gif)
+![Scrubbing a 41-frame sequence with the live threshold overlay](docs/demo.gif)
+
+*Scrubbing with the live threshold overlay on. The mask is recomputed per frame.*
 
 ## Why not ImageJ / Fiji?
 
 tiffscope does one thing fast instead of everything slowly:
 
-- **Instant scrubbing** through large sequences (sliding RAM buffer, lazy loading, precomputed display LUT — no full-stack load, no waiting).
-- **Raw pixel fidelity** — 12/16-bit values shown unscaled in the pixel probe; display contrast/gamma never touches the data.
-- **Live, reorderable pipeline** — every operation previews on the current frame as you tune parameters, at full scrub speed.
+- **Instant scrubbing** — sliding RAM buffer, lazy loading, precomputed display LUT. No full-stack load, no waiting.
+- **Raw pixel fidelity** — 12/16-bit values shown unscaled in the pixel probe; display contrast and gamma never touch the data.
+- **Live, reorderable pipeline** — every operation previews on the current frame as you tune it, at full scrub speed.
 
 ## Features
 
-- **Lazy TIFF sequence loading** — opens folders with thousands of 12/16-bit frames instantly; only a ±20-frame window lives in RAM.
-- **Non-destructive processing pipeline** — add, reorder, enable/disable operations live:
-  - Rotate, Crop (interactive ROI)
-  - Background subtraction (median/mean of sampled frames)
-  - CLAHE, Gaussian blur, sharpen, low-pass, high-pass
-  - Adaptive thresholding with live overlay
-  - Binary mask chain: morphology (erode/dilate/open/close/…), median smoothing, watershed splitting of merged blobs
-  - Intensity-guided watershed: splits touching particles using upstream grayscale peaks and reconstructs per-particle circles
-- **Pipelines save/load as JSON** — reproducible preprocessing, shareable with collaborators.
-- **Mask export** — write the full binary chain out as 0/255 uint8 TIFFs for your PIV/PTV/tracking software.
-- **Analysis tools**
-  - Blob size histogram — pick size thresholds empirically from the actual data
-  - Region props (area, equivalent diameter, axes, eccentricity) with physical-unit conversion and CSV export
-  - Mie particle sizing — invert a Mie scattering solution to get a particle-size distribution (D10/D50/D90) from laser-sheet-lit particle cross-sections
-  - Live optical flow overlay (Farnebäck) for a qualitative look at motion before running full analysis
-- **Measurement** — pixel-to-physical scale calibration, horizontal/vertical measurement rays.
-- **Facet thickness** — measure thin-film coating thickness *perpendicular to a slanted substrate facet*. You click the points; the perpendicular geometry is computed exactly by orthogonal (total least squares) line fitting. Live table, live thickness-vs-position plot, JSON sessions and CSV export.
-- **Performance monitor** — per-operation timing of the live pipeline (`Ctrl+Shift+M`).
+- **Lazy loading** — folders with thousands of 12/16-bit frames open instantly; only a ±20-frame window lives in RAM.
+- **Non-destructive pipeline** — add, reorder, enable/disable live:
+  - Rotate, crop (interactive ROI), background subtraction (temporal or rolling-ball)
+  - CLAHE, gaussian blur, sharpen, low/high pass
+  - Thresholding with live overlay — adaptive or global (Otsu/manual), bright-on-dark or dark-on-bright
+  - Binary mask chain — morphology, median smoothing, blob size filter, watershed splitting of merged particles
+- **Pipelines save/load as JSON** — reproducible, shareable.
+- **Mask export** — the full binary chain as 0/255 uint8 TIFFs.
+- **Analysis** — blob size histogram, region props (area, diameter, axes, eccentricity) with physical units and CSV export, Mie particle sizing, live optical flow overlay.
+- **Measurement** — pixel-to-physical calibration, measurement rays, and perpendicular coating-thickness measurement on slanted facets.
 
 ## Installation
 
@@ -53,48 +47,42 @@ pip install -r requirements.txt
 python main.py
 ```
 
-1. `Ctrl+O` → pick any TIFF inside your sequence folder — the whole folder loads as a sequence (natural sort order).
-2. Scrub with `←` / `→`.
-3. `Ctrl+P` opens the pipeline panel — add operations, drag to reorder, tune parameters with live preview.
-4. `Ctrl+T` for contrast/gamma (display only — data is untouched).
-5. Add an *Adaptive Threshold* op to get a live binary overlay; "Apply to All" caches masks for the whole sequence; "Save Masks…" exports them as TIFFs.
+1. `Ctrl+O` → pick any TIFF in your sequence folder; the whole folder loads in natural sort order.
+2. Scrub with the slider, `←`/`→`, or type a frame number.
+3. `Ctrl+P` opens the pipeline panel — add stages, drag to reorder, tune with live preview.
 
-## Keyboard shortcuts
+   ![Adaptive threshold block size tuned live](docs/tuning.gif)
 
-| Key | Action |
-|-----|--------|
-| `←` / `→` | Previous / next frame |
-| `Ctrl+O` | Open sequence |
-| `Ctrl+P` | Pipeline panel |
-| `Ctrl+T` | Contrast & histogram |
-| `Ctrl+F` | Optical flow overlay |
-| `Ctrl+R` | Rotate 90° CW |
-| `Ctrl+0` | Reset zoom/pan |
-| `Ctrl++` / `Ctrl+-` | Zoom in / out |
-| `Ctrl+Shift+C` | Toggle crop mode |
-| `Ctrl+Shift+X` | Clear crop |
-| `Enter` / `Esc` | Confirm / cancel ROI |
-| `H` / `V` | Place horizontal / vertical measurement ray |
-| `Ctrl+M` | Set pixel scale |
-| `Ctrl+Shift+P` | Facet thickness panel |
-| `Ctrl+Shift+A` | Start / resume facet clicking |
-| `Ctrl+Shift+M` | Performance monitor |
+   *Sweeping adaptive-threshold block size; the mask and the block grid track it live.*
+4. `Ctrl+T` for contrast/gamma. After background subtraction, hit **Auto contrast**.
+5. Add a threshold stage for a live binary overlay, then "Apply to All" and "Save Masks…".
+
+`F1` lists every shortcut.
 
 ## Typical workflows
 
-**PIV/PTV preprocessing** — rotate → crop to ROI → background subtract → save cropped, cleaned frames or thresholded particle masks for your PIV software.
+**PIV/PTV preprocessing** — rotate → crop → background subtract → export cleaned frames or particle masks.
 
-**Particle sizing** — adaptive threshold → morphology cleanup → intensity watershed to split touching particles → region props with physical units → CSV.
+**Particle sizing** — threshold → morphology → blob size filter → intensity watershed to split touching particles → region props in physical units → CSV.
 
-**Mie particle sizing (laser-sheet scattering)** — set the scale, threshold the laser-sheet-lit particles, then Analysis → *Mie Particle Sizing*. Each blob's area (in m²) is taken as its scattering cross-section C_sca; a forward Mie curve is inverted per particle for the complex refractive index you supply, and the radii are fit with a Rosin-Rammler distribution reporting D10/D50/D90. Areas come from the live region-props path or an imported CSV.
+**Shadowgraphy / backlit** — particles are dark on a bright field. Set the threshold op's *Polarity* to `dark_on_bright`; if you use the intensity watershed, also set its *Invert intensity*. The two switches are independent.
 
-**Coating thickness on textured substrates** — set the scale, then click the interface and the outer surface on an SEM cross-section; get per-facet perpendicular thickness as a function of position, with the fit residual as the error bar.
+**Mie particle sizing** — set a scale, threshold the laser-sheet-lit particles, then Analysis → *Mie Particle Sizing*. Each blob's area is treated as its scattering cross-section, a forward Mie curve is inverted per particle, and a Rosin-Rammler fit reports D10/D50/D90.
 
-**Just looking** — open a folder, scrub, probe raw pixel values, drop measurement rays. Sometimes that's all you need.
+![Mie particle sizing window](docs/mie.png)
+
+**Coating thickness** — click the interface and outer surface on an SEM cross-section; thickness is measured perpendicular to the fitted facet, with the fit residual as the error bar.
+
+## Notes
+
+- **Noise blobs skew small-particle statistics.** A noisy threshold leaves 1–2 px blobs that downstream analysis cannot distinguish from real particles. Use *Blob Size Analysis* to find the cutoff, then a *Blob Size Filter* stage. Prefer it to morphological opening when area is the measurement — opening erodes what it keeps.
+- **The Mie forward sweep is the expensive step.** Its cost is shown live before you run it, and it can be cancelled. Particles outside the swept radius range are clamped, and the window says so.
 
 ## Architecture
 
-Six files, no packages: `image_engine.py` (I/O + pixel math), `operations.py` (processing ops), `pipeline.py` (ordering/caching/serialization), `measurement.py` (facet thickness geometry), `mie.py` (Mie scattering + Rosin-Rammler sizing), `main.py` (PyQt6 + pyqtgraph GUI). Everything except `main.py` has zero GUI imports and is usable headless.
+Six files, no packages: `image_engine.py` (I/O + pixel math), `operations.py` (processing ops), `pipeline.py` (ordering/caching/serialization), `measurement.py` (facet geometry), `mie.py` (Mie scattering + Rosin-Rammler), `main.py` (PyQt6 + pyqtgraph GUI). Everything except `main.py` has zero GUI imports and is usable headless.
+
+The README media is generated by `docs/make_media.py`, which drives the app and assembles the GIFs with ffmpeg — rerun it after a UI change instead of re-recording by hand.
 
 ## Roadmap
 
@@ -106,7 +94,7 @@ Issues and PRs welcome.
 
 ## Citation
 
-The Mie particle-sizing method (laser-sheet scattering cross-section → size distribution) is from:
+The Mie particle-sizing method is from:
 
 > S. Dasgupta, S. Raut, V. Vadukut, M. Bose, "Design and Development of a Pneumatic Atomizer for Seeding Tracers in PIV Experiments," *Journal of Flow Visualization and Image Processing*, 32(3), 2025.
 
@@ -124,4 +112,4 @@ The Mie particle-sizing method (laser-sheet scattering cross-section → size di
 
 ## License
 
-[MIT](LICENSE). Note that [PyQt6](https://www.riverbankcomputing.com/software/pyqt/) (a dependency you install separately) is GPL-licensed; this affects redistribution of bundled binaries, not use of this source code.
+[MIT](LICENSE). [PyQt6](https://www.riverbankcomputing.com/software/pyqt/) (installed separately) is GPL-licensed; that affects redistribution of bundled binaries, not use of this source.
