@@ -21,6 +21,11 @@ Thumbs.db
 
 # Raw screen recordings (converted GIFs in docs/ are committed)
 recordings/
+
+# Internal media generators. They drive the app against a local test sequence
+# that is not distributed, so they are not runnable from a clean checkout.
+docs/make_media.py
+docs/make_walkthrough.py
 ToDo.txt
 CLAUDE.md
 test_ops.py

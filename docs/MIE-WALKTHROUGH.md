@@ -1,8 +1,14 @@
 # Mie particle sizing: a full walkthrough
 
 How to get a particle size distribution out of a laser-sheet image sequence,
-start to finish. Every screenshot on this page comes from the same 41-frame
-test sequence, so the numbers quoted here are the numbers you should see.
+start to finish.
+
+Every screenshot is one worked example, run on the same 41-frame sequence of
+NaCl particles lit by a 527 nm sheet. That dataset is not distributed with
+tiffscope, so treat the numbers as an illustration of what a healthy run looks
+like rather than something to reproduce. Yours will differ. What carries over
+is the order of the steps, what to look at in each window, and where the
+answer is sensitive to a choice you made earlier.
 
 **The short version:** each blob in the binary mask is treated as one particle,
 its area is its scattering cross-section C_sca, a forward Mie curve C_sca(a) is
@@ -237,19 +243,6 @@ Quote all of these together, because each one moves the answer:
   older MATLAB runs)
 - Number of particles sized
 - Whether D-values came from the Rosin-Rammler fit or from percentiles
-
-## Regenerating these images
-
-Every screenshot here is produced by driving the real app, not by a screen
-recorder:
-
-```bash
-python docs/make_walkthrough.py <sequence-folder> <pipeline.json> docs/
-```
-
-Callout badges are placed from live widget geometry, so moving or resizing a
-control keeps its badge. Rerun this after a UI change instead of editing the
-images.
 
 ## Method
 
