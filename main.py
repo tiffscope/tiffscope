@@ -1459,19 +1459,23 @@ class MieAnalysisWindow(QWidget):
         self.num_a = QLineEdit("50000")
         self.num_a.setValidator(QIntValidator(100, 500000))
         self.num_a.setToolTip(
-            "Radius sweep resolution. 50000 matches the original MATLAB "
-            "(accurate but slow); lower it to trade fidelity for speed."
+            "How many radii the forward Mie curve is evaluated at.\n"
+            "More points resolve the Mie ripples better and cost runtime\n"
+            "in direct proportion. 4000 is enough while you are tuning;\n"
+            "50000 for a final number."
         )
         self.num_a.textChanged.connect(self._update_cost_hint)
         rad_form.addRow("grid points:", self.num_a)
 
         self.inversion_combo = QComboBox()
         self.inversion_combo.addItem("Smoothed trend", "trend")
-        self.inversion_combo.addItem("Legacy (MATLAB unique)", "legacy")
+        self.inversion_combo.addItem("Legacy (unsmoothed)", "legacy")
         self.inversion_combo.setToolTip(
-            "Smoothed trend: grid-stable, inverts the monotone mean of C_sca(a).\n"
-            "Legacy: original MATLAB unique() — grid-sensitive in the ripple regime,\n"
-            "kept only to reproduce prior runs."
+            "Smoothed trend: inverts the monotone mean of C_sca(a). Grid-stable,\n"
+            "and the right choice for sizing a population.\n"
+            "Legacy: inverts the raw rippled curve, where one cross-section maps\n"
+            "to several radii, so the answer shifts with the grid. Kept only to\n"
+            "reproduce runs made before the trend method existed."
         )
         rad_form.addRow("inversion:", self.inversion_combo)
 

@@ -174,8 +174,9 @@ numbered steps.
    checking your settings quickly.
 3. **Refractive index** of the particle. 1.544 for NaCl. The imaginary part is
    absorption, 0 for a transparent particle.
-4. **Grid points.** Resolution of the forward sweep. 50000 matches the original
-   MATLAB. 4000 is plenty for tuning and much faster.
+4. **Grid points.** How many radii the forward curve is evaluated at. More
+   points resolve the Mie ripples better and cost runtime in direct
+   proportion. Use 4000 while you are tuning and 50000 for a final number.
 5. **Run.**
 
 Also set λ to your laser wavelength (527 nm here) and leave *n medium* at 1.0
@@ -187,6 +188,12 @@ headroom. **Auto range from areas** re-seeds it later if you change the mask.
 
 Keep the sweep tight. Runtime scales with the largest radius in it, so a loose
 upper bound costs minutes and leaves most of the x-axis empty.
+
+Leave **inversion** on *Smoothed trend*. In the ripple regime a single
+cross-section can map to several radii, so inverting the raw curve makes the
+answer depend on how finely you sampled it. The trend method inverts the smooth
+mean of the curve instead, which is what you want when sizing a population.
+*Legacy* is there only to match runs made before that method existed.
 
 ## 8. Read the result
 
@@ -239,8 +246,8 @@ Quote all of these together, because each one moves the answer:
 - `min_area` and which mask stage the areas came from
 - Refractive index and wavelength
 - Radius sweep bracket and grid points
-- Inversion method (*Smoothed trend* by default, *Legacy* only to reproduce
-  older MATLAB runs)
+- Inversion method (*Smoothed trend* is the default and what you want,
+  *Legacy* only if you are matching an older run)
 - Number of particles sized
 - Whether D-values came from the Rosin-Rammler fit or from percentiles
 
