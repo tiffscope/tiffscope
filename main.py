@@ -2584,8 +2584,10 @@ class ParamsWidget(QWidget):
         self.on_change = on_change
         self._updating = False
         self._widgets = {}
+        self._labels = {}
 
         layout = QFormLayout(self)
+        self._layout = layout
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
         # Long labels ("Invert intensity (dark particles):") otherwise set the
@@ -2651,7 +2653,43 @@ class ParamsWidget(QWidget):
             if help_text:
                 # Tooltip on the label too — users hover the name, not the box.
                 label.setToolTip(help_text)
+            self._labels[key] = label
             layout.addRow(label, w)
+
+        # Hide fields whose `visible_when` condition the current params don't meet
+        # (e.g. GlobalThresholdOp shows only the value field for the active method).
+        self._apply_visibility()
+
+    def _apply_visibility(self):
+        """Show/hide each field per its optional schema `visible_when`.
+
+        A spec may carry `visible_when: {param_key: [allowed, values]}`; the field
+        (and its label) is shown only when every listed controlling param holds one
+        of its allowed values. No `visible_when` -> always visible.
+        """
+        for spec in self.op.params_schema:
+            cond = spec.get("visible_when")
+            if not cond:
+                continue
+            visible = all(self.op.params.get(k) in vals for k, vals in cond.items())
+            self._set_row_visible(spec["key"], visible)
+
+    def _set_row_visible(self, key, visible):
+        w = self._widgets.get(key)
+        if w is None:
+            return
+        # setRowVisible (Qt 6.4+) collapses the whole row so no gap is left.
+        # Fall back to hiding the two widgets where it is unavailable.
+        if hasattr(self._layout, "setRowVisible"):
+            try:
+                self._layout.setRowVisible(w, visible)
+                return
+            except Exception:
+                pass
+        w.setVisible(visible)
+        lbl = self._labels.get(key)
+        if lbl is not None:
+            lbl.setVisible(visible)
 
     def _snap_odd(self, key, spin, lo, hi):
         """Round a committed even value up to the next odd one, in range.
@@ -2672,6 +2710,8 @@ class ParamsWidget(QWidget):
         if self._updating:
             return
         self.op.params[key] = val
+        # A control param (e.g. method) may have flipped which fields apply.
+        self._apply_visibility()
         self.on_change()
 
     def refresh(self):
@@ -2686,6 +2726,7 @@ class ParamsWidget(QWidget):
                 choices = spec.get("choices", [])
                 if val in choices:
                     w.setCurrentIndex(choices.index(val))
+        self._apply_visibility()
         self._updating = False
 
 
@@ -4094,7 +4135,7 @@ class TiffViewerApp(QMainWindow):
             lambda checked: self._toggle_threshold_op(AdaptiveThresholdOp, self.threshold_action, checked))
         analysis_menu.addAction(self.threshold_action)
 
-        self.global_threshold_action = QAction("Global Threshold (Otsu)", self, checkable=True)
+        self.global_threshold_action = QAction("Global Threshold (Otsu / manual / fixed)", self, checkable=True)
         self.global_threshold_action.triggered.connect(
             lambda checked: self._toggle_threshold_op(GlobalThresholdOp, self.global_threshold_action, checked))
         analysis_menu.addAction(self.global_threshold_action)

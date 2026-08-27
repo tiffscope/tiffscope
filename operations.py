@@ -310,14 +310,28 @@ class GlobalThresholdOp(Operation):
     as *the* threshold stage (overlay, binary chain anchor, batch cache,
     save-masks), so at most one such op should be enabled at a time."""
     name = "GlobalThresholdOp"
-    display_name = "Global Threshold (Otsu / manual)"
+    display_name = "Global Threshold"
     supports_batch_cache = True
     is_threshold_op = True
     params_schema = [
         {"key": "method", "type": "str", "default": "otsu",
-         "choices": ["otsu", "manual"], "label": "Method", "widget": "combo"},
+         "choices": ["otsu", "manual", "fixed"], "label": "Method", "widget": "combo",
+         "help": "otsu: automatic split, recomputed per frame.  "
+                 "manual: a value in each frame's normalised 0-255 range "
+                 "(still per-frame, since the normalisation is per-frame).  "
+                 "fixed: a raw pixel value applied identically to every frame "
+                 "(sequence-wide) - use this when the same intensity means the "
+                 "same thing across the whole sequence."},
         {"key": "value", "type": "int", "default": 128, "range": [0, 255],
-         "label": "Threshold value (manual)", "widget": "spinbox"},
+         "label": "Threshold value (manual)", "widget": "spinbox",
+         "visible_when": {"method": ["manual"]},
+         "help": "Only used by method=manual.  Value in the per-frame "
+                 "normalised 0-255 range."},
+        {"key": "fixed_value", "type": "int", "default": 128, "range": [0, 65535],
+         "label": "Fixed value (raw, sequence-wide)", "widget": "spinbox",
+         "visible_when": {"method": ["fixed"]},
+         "help": "Only used by method=fixed.  Raw pixel intensity, same units as "
+                 "the pixel probe, applied identically to every frame."},
         {"key": "blur_size", "type": "int", "default": 1, "range": [1, 51],
          "label": "Blur kernel (1=off)", "widget": "spinbox", "step": 2},
         # See AdaptiveThresholdOp.polarity.  dark_on_bright is the shadowgraphy
@@ -342,6 +356,27 @@ class GlobalThresholdOp(Operation):
 
         # Same defensive contiguity fix as AdaptiveThresholdOp.
         frame = np.ascontiguousarray(frame)
+
+        polarity = self.params.get("polarity")
+
+        # Fixed sequence-wide threshold: compare RAW pixel values against a
+        # user-set value that means the same thing in every frame.  Unlike
+        # method="manual" (which thresholds the per-frame [min,max]->[0,255]
+        # normalisation, so the effective raw cutoff drifts frame to frame),
+        # this obeys the whole sequence.  Full bit-depth range, polarity-aware,
+        # always emits 255 = particle.  Pure-numpy compare so it is dtype- and
+        # bit-depth-agnostic (uint12/16 raw, or float from BgSubtractOp).
+        if method_str == "fixed":
+            raw_value = self.params["fixed_value"]
+            work = frame
+            if blur_size > 1:
+                k = blur_size if blur_size % 2 == 1 else blur_size + 1
+                work = cv2.GaussianBlur(frame.astype(np.float32), (k, k), 0)
+            if polarity == "dark_on_bright":
+                hit = work <= raw_value
+            else:
+                hit = work >= raw_value
+            return np.where(hit, 255, 0).astype(np.uint8)
 
         d = frame.astype(np.float32)
         lo, hi = d.min(), d.max()
