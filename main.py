@@ -19,7 +19,7 @@ from PyQt6.QtGui import QShortcut, QKeySequence, QAction, QActionGroup, QColor, 
 
 from image_engine import LazyTiffSequence, scale_16bit_to_8bit, build_display_lut
 from operations import (
-    straighten_valid_size,
+    straighten_valid_size, apply_op,
     Operation, RotateOp, StraightenOp, CropOp, BgSubtractOp, RollingBallBgOp, AdaptiveThresholdOp,
     GlobalThresholdOp,
     CLAHEOp, GaussianBlurOp, SharpenOp, LowPassOp, HighPassOp,
@@ -103,7 +103,7 @@ class ThresholdBatchWorker(QThread):
                 frame = raw
                 for j, step in enumerate(self.pipeline.operations[:self.op_idx]):
                     if step.enabled:
-                        frame = step.apply(frame)
+                        frame = apply_op(step, frame, i)
                 mask = self.op.apply(frame)
                 masks[i] = mask
                 self.progress.emit(i + 1, n)
@@ -246,7 +246,7 @@ class BlobSizeAnalysisWorker(QThread):
                     raw = tifffile.imread(file_paths[frame_idx])
                     frame = raw
                     for op in upstream_ops:
-                        frame = op.apply(frame)
+                        frame = apply_op(op, frame, frame_idx)
                     mask = thresh_op.apply(frame)
 
                 for op in self.binary_chain_ops:
@@ -805,7 +805,7 @@ class RegionPropsWorker(QThread):
                     raw = tifffile.imread(file_paths[frame_idx])
                     frame = raw
                     for op in upstream_ops:
-                        frame = op.apply(frame)
+                        frame = apply_op(op, frame, frame_idx)
                     mask = thresh_op.apply(frame)
 
                 for op in self.binary_chain_ops:
@@ -3982,7 +3982,7 @@ class TiffViewerApp(QMainWindow):
 
         sample_n = op.params.get("sample_n", 50)
 
-        progress = QProgressDialog("Loading frames...", None, 0, sample_n, self)
+        progress = QProgressDialog("Building background...", None, 0, sample_n, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setWindowTitle("Background Computation")
         progress.setMinimumDuration(0)
@@ -3994,8 +3994,7 @@ class TiffViewerApp(QMainWindow):
         self._bg_worker = BgComputeWorker(op, op_idx, self.pipeline, self.sequence_manager)
 
         def on_progress(c, t):
-            if c > sample_n and progress.maximum() <= sample_n:
-                progress.setLabelText("Computing median...")
+            if progress.maximum() != t:
                 progress.setMaximum(t)
             progress.setValue(c)
 
@@ -4455,6 +4454,17 @@ class TiffViewerApp(QMainWindow):
     # Legacy Analysis menu shims (delegate to pipeline ops)
     # ------------------------------------------------------------------
 
+    def _sequence_looks_like_ab_pairs(self) -> bool:
+        """True when the files alternate …A, …B, …A, …B by the last character
+        of their name (e.g. "…LA.TIF" / "…LB.TIF"), the usual PIV pair naming."""
+        if self.sequence_manager is None:
+            return False
+        files = self.sequence_manager.files
+        if len(files) < 4 or len(files) % 2:
+            return False
+        tails = [os.path.splitext(f)[0][-1:].upper() for f in files]
+        return all(t == "A" for t in tails[0::2]) and all(t == "B" for t in tails[1::2])
+
     def compute_background_dialog(self):
         if self.sequence_manager is None:
             QMessageBox.warning(self, "No Sequence", "Open a TIFF sequence first.")
@@ -4536,6 +4546,19 @@ class TiffViewerApp(QMainWindow):
         layout.addWidget(sample_spin)
         layout.addWidget(mem_label)
 
+        pairs_check = QCheckBox("Separate backgrounds for A and B frames (PIV pairs)")
+        pairs_check.setToolTip(
+            "For sequences stored A, B, A, B…: build one background from the A frames\n"
+            "and one from the B frames, and subtract each from its own kind.\n"
+            "Use it when the two laser pulses differ in brightness."
+        )
+        _, _existing_bg = self._find_op(BgSubtractOp)
+        if _existing_bg is not None:
+            pairs_check.setChecked(_existing_bg.params.get("frame_groups") == "ab_pairs")
+        else:
+            pairs_check.setChecked(self._sequence_looks_like_ab_pairs())
+        layout.addWidget(pairs_check)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
@@ -4555,6 +4578,7 @@ class TiffViewerApp(QMainWindow):
 
         op.params["method"] = method
         op.params["sample_n"] = sample_n
+        op.params["frame_groups"] = "ab_pairs" if pairs_check.isChecked() else "single"
         self._run_bg_fit(op, op_idx)
 
         self.bg_subtract_action.setEnabled(True)
@@ -4631,14 +4655,19 @@ class TiffViewerApp(QMainWindow):
         os.makedirs(save_dir, exist_ok=True)
 
         try:
-            bg = op.get_background()
-            if self.current_raw_frame is not None and np.issubdtype(self.current_raw_frame.dtype, np.integer):
-                max_val = np.iinfo(self.current_raw_frame.dtype).max
-                bg_to_save = np.clip(bg, 0, max_val).astype(self.current_raw_frame.dtype)
-            else:
-                bg_to_save = bg
-            tifffile.imwrite(os.path.join(save_dir, fname), bg_to_save)
-            self.status_label.setText(f"Background saved: {os.path.join(save_dir, fname)}")
+            bgs = op.get_backgrounds()
+            # A/B backgrounds go out as two files: name_A.tif and name_B.tif.
+            stem, ext = os.path.splitext(fname)
+            names = [fname] if len(bgs) == 1 else [f"{stem}_{tag}{ext}" for tag in "AB"]
+            for bg, name in zip(bgs, names):
+                if self.current_raw_frame is not None and np.issubdtype(self.current_raw_frame.dtype, np.integer):
+                    max_val = np.iinfo(self.current_raw_frame.dtype).max
+                    bg_to_save = np.clip(bg, 0, max_val).astype(self.current_raw_frame.dtype)
+                else:
+                    bg_to_save = bg
+                tifffile.imwrite(os.path.join(save_dir, name), bg_to_save)
+            self.status_label.setText(
+                "Background saved: " + ", ".join(os.path.join(save_dir, n) for n in names))
         except Exception as e:
             QMessageBox.critical(self, "Save Failed", str(e))
 

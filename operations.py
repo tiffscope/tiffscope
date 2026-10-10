@@ -88,6 +88,18 @@ class Operation(ABC):
         return hashlib.md5(blob.encode()).hexdigest()
 
 
+def apply_op(op: Operation, frame: np.ndarray, frame_idx: int | None) -> np.ndarray:
+    """Apply one upstream op to a frame of the sequence.
+
+    Ops that set `uses_frame_idx` get the frame's position in the sequence via
+    context; every other op is called exactly as before. Anything that walks
+    the pipeline over real frames should go through this rather than op.apply().
+    """
+    if frame_idx is not None and getattr(op, "uses_frame_idx", False):
+        return op.apply(frame, context={"frame_idx": frame_idx})
+    return op.apply(frame)
+
+
 # ---------------------------------------------------------------------------
 # Concrete operations
 # ---------------------------------------------------------------------------
@@ -215,76 +227,117 @@ class CropOp(Operation):
 class BgSubtractOp(Operation):
     name = "BgSubtractOp"
     display_name = "Background Subtract (temporal)"
+    # Pipeline walkers hand this op the frame's index (see apply_op) so it can
+    # pick the background that belongs to that frame.
+    uses_frame_idx = True
     params_schema = [
         {"key": "method", "type": "str", "default": "median", "choices": ["median", "mean"],
          "label": "Method", "widget": "combo"},
         {"key": "sample_n", "type": "int", "default": 50, "range": [2, 9999],
-         "help": "How many frames are read from disk to build the background. More is cleaner but slower, and costs RAM.",
+         "help": "How many frames are read from disk to build each background. More is cleaner but slower, and costs RAM.",
          "label": "Frames to sample", "widget": "spinbox"},
+        {"key": "frame_groups", "type": "str", "default": "single",
+         "choices": ["single", "ab_pairs"], "label": "Backgrounds", "widget": "combo",
+         "help": "single: one background for every frame.\n"
+                 "ab_pairs: for PIV pairs stored A, B, A, B… — one background from the\n"
+                 "A frames (1st, 3rd, …) and one from the B frames (2nd, 4th, …), each\n"
+                 "subtracted from its own kind. Use it when the two laser pulses differ\n"
+                 "in brightness; a shared background over-subtracts the dimmer frame\n"
+                 "and under-subtracts the brighter one. Click Fit after changing this."},
     ]
 
     def __init__(self):
         super().__init__()
-        self._background: np.ndarray | None = None
+        # One background ("single") or two ("ab_pairs": [A, B]); empty = not fitted.
+        self._backgrounds: list[np.ndarray] = []
 
     @property
     def input_requirements(self) -> dict:
         return {"ndim": 2, "dtypes": ["uint8", "uint16", "float32"]}
+
+    def _n_groups(self) -> int:
+        return 2 if self.params.get("frame_groups") == "ab_pairs" else 1
+
+    @property
+    def _background(self) -> np.ndarray | None:
+        """First background, or None when nothing usable is fitted — including
+        when frame_groups was changed since the fit (stale: needs a re-fit)."""
+        if len(self._backgrounds) != self._n_groups():
+            return None
+        return self._backgrounds[0]
 
     def fit_with_progress(self, pipeline, op_idx: int, sequence, progress_callback=None) -> None:
         import os
         import tifffile
 
         file_paths = [os.path.join(sequence.folder_path, f) for f in sequence.files]
-        sample_n = self.params["sample_n"]
-        n = min(sample_n, len(file_paths))
-        indices = np.unique(np.round(np.linspace(0, len(file_paths) - 1, n)).astype(int))
-        n_loaded = len(indices)
+        n_groups = self._n_groups()
+        # Group g owns frames g, g + n_groups, g + 2 * n_groups, …
+        groups = []
+        for g in range(n_groups):
+            members = np.arange(g, len(file_paths), n_groups)
+            if len(members) == 0:
+                return
+            n = min(self.params["sample_n"], len(members))
+            groups.append(members[np.unique(np.round(np.linspace(0, len(members) - 1, n)).astype(int))])
 
         upstream_ops = [op for op in pipeline.operations[:op_idx] if op.enabled]
+        use_mean = self.params["method"] == 'mean'
+        target_bytes = 128 * 1024 * 1024
+        done = 0
+        total = sum(len(g) for g in groups)   # median chunk steps are added once the frame size is known
 
-        stack = None
-        for i, idx in enumerate(indices):
-            raw = tifffile.imread(file_paths[idx])
-            frame = raw
-            for op in upstream_ops:
-                frame = op.apply(frame)
-            if stack is None:
-                stack = np.empty((n_loaded, *frame.shape), dtype=np.float32)
-            stack[i] = frame.astype(np.float32)
-            if progress_callback:
-                progress_callback(i + 1, n_loaded)
-
-        if stack is None:
-            return
-
-        if self.params["method"] == 'mean':
-            self._background = stack.mean(axis=0).astype(np.float32)
-            del stack
-        else:
-            # Sequential chunked median — no inner thread pool to avoid segfaults
-            # when called from a QThread with OpenCV ops in the upstream pipeline.
-            H, W = stack.shape[1], stack.shape[2]
-            target_bytes = 128 * 1024 * 1024
-            chunk_rows = max(1, int(target_bytes / (n_loaded * W * 4)))
-            n_chunks = max(1, (H + chunk_rows - 1) // chunk_rows)
-            result = np.empty((H, W), dtype=np.float32)
-            completed = 0
-            for r0 in range(0, H, chunk_rows):
-                r1 = min(r0 + chunk_rows, H)
-                result[r0:r1] = np.median(stack[:, r0:r1, :], axis=0)
-                completed += 1
+        backgrounds = []
+        for indices in groups:
+            n_loaded = len(indices)
+            stack = None
+            for i, idx in enumerate(indices):
+                frame = tifffile.imread(file_paths[idx])
+                for op in upstream_ops:
+                    frame = apply_op(op, frame, int(idx))
+                if stack is None:
+                    stack = np.empty((n_loaded, *frame.shape), dtype=np.float32)
+                    if not use_mean and not backgrounds:
+                        H, W = frame.shape
+                        for g in groups:
+                            rows = max(1, int(target_bytes / (len(g) * W * 4)))
+                            total += max(1, (H + rows - 1) // rows)
+                stack[i] = frame.astype(np.float32)
+                done += 1
                 if progress_callback:
-                    progress_callback(n_loaded + completed, n_loaded + n_chunks)
-            del stack
-            self._background = result
+                    progress_callback(done, total)
 
-        self._fit_hash = hashlib.md5(self._background.tobytes()).hexdigest()[:8]
+            if use_mean:
+                result = stack.mean(axis=0).astype(np.float32)
+            else:
+                # Sequential chunked median — no inner thread pool to avoid segfaults
+                # when called from a QThread with OpenCV ops in the upstream pipeline.
+                H, W = stack.shape[1], stack.shape[2]
+                chunk_rows = max(1, int(target_bytes / (n_loaded * W * 4)))
+                result = np.empty((H, W), dtype=np.float32)
+                for r0 in range(0, H, chunk_rows):
+                    r1 = min(r0 + chunk_rows, H)
+                    result[r0:r1] = np.median(stack[:, r0:r1, :], axis=0)
+                    done += 1
+                    if progress_callback:
+                        progress_callback(done, total)
+            del stack
+            backgrounds.append(result)
+
+        self._set_backgrounds(backgrounds)
+
+    def _set_backgrounds(self, backgrounds: list) -> None:
+        self._backgrounds = backgrounds
+        h = hashlib.md5()
+        for bg in backgrounds:
+            h.update(bg.tobytes())
+        self._fit_hash = h.hexdigest()[:8] if backgrounds else ""
 
     def apply(self, frame: np.ndarray, context=None) -> np.ndarray:
-        if self._background is None:
+        frame_idx = (context or {}).get("frame_idx")
+        bg = self.get_background(frame_idx)
+        if bg is None:
             return frame
-        bg = self._background
         if bg.shape != frame.shape:
             return frame
         out = frame.astype(np.float32)
@@ -292,15 +345,20 @@ class BgSubtractOp(Operation):
         np.clip(out, 0, None, out=out)
         return out.astype(frame.dtype)
 
-    def get_background(self) -> np.ndarray | None:
-        return self._background
+    def get_background(self, frame_idx: int | None = None) -> np.ndarray | None:
+        """Background for the given frame (the first one when no index is given)."""
+        if self._background is None:
+            return None
+        if frame_idx is None:
+            return self._backgrounds[0]
+        return self._backgrounds[frame_idx % len(self._backgrounds)]
+
+    def get_backgrounds(self) -> list:
+        """All usable backgrounds: [bg] for single, [A, B] for ab_pairs, [] if unfitted or stale."""
+        return list(self._backgrounds) if self._background is not None else []
 
     def set_background(self, bg: np.ndarray) -> None:
-        self._background = bg
-        if bg is not None:
-            self._fit_hash = hashlib.md5(bg.tobytes()).hexdigest()[:8]
-        else:
-            self._fit_hash = ""
+        self._set_backgrounds([] if bg is None else [bg])
 
     def to_dict(self) -> dict:
         d = super().to_dict()

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from operations import Operation, operation_from_dict
+from operations import Operation, apply_op, operation_from_dict
 
 if TYPE_CHECKING:
     from image_engine import LazyTiffSequence
@@ -112,7 +112,7 @@ class Pipeline:
             if cached is not None:
                 result = cached
                 continue
-            result = op.apply(result)
+            result = apply_op(op, result, frame_idx)
         return result
 
     def apply_with_snapshots(
@@ -156,10 +156,10 @@ class Pipeline:
             else:
                 if timings is not None:
                     _t0 = time.perf_counter()
-                    result = op.apply(result)
+                    result = apply_op(op, result, frame_idx)
                     timings[f"  [{i}] {op.name}"] = (time.perf_counter() - _t0) * 1000.0
                 else:
-                    result = op.apply(result)
+                    result = apply_op(op, result, frame_idx)
             if i in snapshot_indices:
                 snapshots[i] = result
         return result, snapshots
