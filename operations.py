@@ -111,6 +111,83 @@ class RotateOp(Operation):
         return np.ascontiguousarray(np.rot90(frame, k=-k))
 
 
+def straighten_valid_size(w: int, h: int, angle_deg: float, margin: int = 1) -> tuple[int, int]:
+    """Size (cw, ch) of the largest axis-aligned rectangle, centred on the
+    frame, that contains only real pixels after a w x h frame is rotated by
+    angle_deg about its centre.
+
+    `margin` pixels are shaved off each side so the interpolation kernel never
+    reaches into the constant-fill border. cw/ch keep the parity of w/h so the
+    crop stays exactly centred on the rotation centre.
+    """
+    a = np.deg2rad(abs(float(angle_deg)) % 180.0)
+    sin_a, cos_a = abs(np.sin(a)), abs(np.cos(a))
+    # Extent between outermost pixel centres, not the pixel count.
+    ew, eh = max(w - 1, 0), max(h - 1, 0)
+    long_side, short_side = max(ew, eh), min(ew, eh)
+    if short_side <= 2.0 * sin_a * cos_a * long_side or abs(sin_a - cos_a) < 1e-10:
+        # Half-constrained case: two corners touch the longer sides.
+        x = 0.5 * short_side
+        wr, hr = (x / sin_a, x / cos_a) if ew >= eh else (x / cos_a, x / sin_a)
+    else:
+        cos_2a = cos_a * cos_a - sin_a * sin_a
+        wr = (ew * cos_a - eh * sin_a) / cos_2a
+        hr = (eh * cos_a - ew * sin_a) / cos_2a
+    cw = int(np.floor(wr)) + 1 - 2 * margin
+    ch = int(np.floor(hr)) + 1 - 2 * margin
+    if (w - cw) % 2:
+        cw -= 1
+    if (h - ch) % 2:
+        ch -= 1
+    return max(1, min(cw, w)), max(1, min(ch, h))
+
+
+_STRAIGHTEN_INTERP = {
+    "bicubic":  cv2.INTER_CUBIC,
+    "bilinear": cv2.INTER_LINEAR,
+    "nearest":  cv2.INTER_NEAREST,
+}
+
+
+class StraightenOp(Operation):
+    """Fine rotation by an arbitrary angle (RotateOp handles lossless 90° turns)."""
+    name = "StraightenOp"
+    display_name = "Straighten"
+    params_schema = [
+        {"key": "angle", "type": "float", "default": 0.0, "range": [-45.0, 45.0],
+         "step": 0.1, "decimals": 2, "label": "Angle (° CW)", "widget": "dspinbox",
+         "help": "Rotation about the frame centre. Positive turns the image clockwise."},
+        {"key": "edges", "type": "str", "default": "autocrop",
+         "choices": ["autocrop", "fill_black"], "label": "Edges", "widget": "combo",
+         "help": "autocrop: trim to the largest rectangle with no empty corners.\n"
+                 "fill_black: keep the frame size and fill the empty corners with 0."},
+        {"key": "interpolation", "type": "str", "default": "bicubic",
+         "choices": ["bicubic", "bilinear", "nearest"], "label": "Interpolation",
+         "widget": "combo"},
+    ]
+
+    def apply(self, frame: np.ndarray, context=None) -> np.ndarray:
+        return self.rotate(frame, crop=self.params["edges"] == "autocrop")
+
+    def rotate(self, frame: np.ndarray, crop: bool) -> np.ndarray:
+        """Rotate by the current angle. crop=False keeps the frame size with
+        black corners (Straighten Mode previews this to outline what is kept)."""
+        angle = float(self.params["angle"])
+        if angle == 0.0:
+            return frame
+        h, w = frame.shape[:2]
+        # OpenCV's positive angle is counter-clockwise; ours is clockwise.
+        M = cv2.getRotationMatrix2D(((w - 1) / 2.0, (h - 1) / 2.0), -angle, 1.0)
+        interp = _STRAIGHTEN_INTERP.get(self.params["interpolation"], cv2.INTER_CUBIC)
+        out = cv2.warpAffine(np.ascontiguousarray(frame), M, (w, h), flags=interp,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        if crop:
+            cw, ch = straighten_valid_size(w, h, angle)
+            x0, y0 = (w - cw) // 2, (h - ch) // 2
+            out = out[y0:y0 + ch, x0:x0 + cw]
+        return np.ascontiguousarray(out)
+
+
 class CropOp(Operation):
     name = "CropOp"
     display_name = "Crop"
@@ -1057,7 +1134,7 @@ class IntensityWatershedSplitOp(Operation):
 
 OPERATION_REGISTRY: dict[str, type[Operation]] = {
     cls.name: cls
-    for cls in [RotateOp, CropOp, BgSubtractOp, RollingBallBgOp, AdaptiveThresholdOp,
+    for cls in [RotateOp, StraightenOp, CropOp, BgSubtractOp, RollingBallBgOp, AdaptiveThresholdOp,
                 GlobalThresholdOp, CLAHEOp, GaussianBlurOp, SharpenOp, LowPassOp, HighPassOp,
                 MorphologyOp, BinarySmoothOp, BlobSizeFilterOp, WatershedSplitOp,
                 IntensityWatershedSplitOp]

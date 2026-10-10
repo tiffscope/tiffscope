@@ -10,7 +10,7 @@ import pyqtgraph as pg
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QFormLayout,
     QWidget, QLabel, QFileDialog, QSlider, QMessageBox, QDialog, QComboBox,
-    QSpinBox, QDialogButtonBox, QProgressDialog, QPushButton, QLineEdit,
+    QSpinBox, QDoubleSpinBox, QDialogButtonBox, QProgressDialog, QPushButton, QLineEdit,
     QListWidget, QListWidgetItem, QCheckBox, QGroupBox, QScrollArea,
     QSizePolicy, QRadioButton, QButtonGroup, QFrame, QGridLayout, QProgressBar,
 )
@@ -19,7 +19,8 @@ from PyQt6.QtGui import QShortcut, QKeySequence, QAction, QActionGroup, QColor, 
 
 from image_engine import LazyTiffSequence, scale_16bit_to_8bit, build_display_lut
 from operations import (
-    Operation, RotateOp, CropOp, BgSubtractOp, RollingBallBgOp, AdaptiveThresholdOp,
+    straighten_valid_size,
+    Operation, RotateOp, StraightenOp, CropOp, BgSubtractOp, RollingBallBgOp, AdaptiveThresholdOp,
     GlobalThresholdOp,
     CLAHEOp, GaussianBlurOp, SharpenOp, LowPassOp, HighPassOp,
     MorphologyOp, BinarySmoothOp, BlobSizeFilterOp, WatershedSplitOp,
@@ -2510,7 +2511,7 @@ class IntensityWatershedParamsWidget(QWidget):
         """Build combo choices from shape-compatible stages upstream of AdaptiveThresholdOp.
 
         Only ops whose output has the same H×W as the binary mask are listed.
-        That means ops at indices strictly after the last RotateOp / CropOp in the
+        That means ops at indices strictly after the last RotateOp / StraightenOp / CropOp in the
         pipeline (those are the shape-changing ops).  The sentinel value −1 means
         "pre-threshold frame" — the exact frame fed into AdaptiveThresholdOp —
         which is always shape-compatible by definition.
@@ -2528,7 +2529,7 @@ class IntensityWatershedParamsWidget(QWidget):
 
         # Find the last enabled shape-changing op before AdaptiveThresholdOp.
         # Ops at index ≤ last_shape_idx may change H or W; skip them.
-        _SHAPE_OPS = (RotateOp, CropOp)
+        _SHAPE_OPS = (RotateOp, StraightenOp, CropOp)
         last_shape_idx = -1
         for i, op in enumerate(pipeline.operations[:limit]):
             if isinstance(op, _SHAPE_OPS) and op.enabled:
@@ -2625,6 +2626,15 @@ class ParamsWidget(QWidget):
                     w.editingFinished.connect(
                         lambda k=key, sb=w, lo=lo, hi=hi: self._snap_odd(k, sb, lo, hi)
                     )
+            elif widget_hint == "dspinbox":
+                w = QDoubleSpinBox()
+                lo, hi = spec.get("range", [0.0, 99999.0])
+                w.setRange(lo, hi)
+                w.setDecimals(spec.get("decimals", 2))
+                w.setSingleStep(spec.get("step", 0.1))
+                w.setValue(current)
+                w.setKeyboardTracking(False)
+                w.valueChanged.connect(lambda val, k=key: self._emit(k, val))
             elif widget_hint == "combo":
                 w = QComboBox()
                 # See IntensityWatershedParamsWidget: AdjustToContents makes the
@@ -2720,7 +2730,7 @@ class ParamsWidget(QWidget):
             key = spec["key"]
             w = self._widgets.get(key)
             val = self.op.params[key]
-            if isinstance(w, QSpinBox):
+            if isinstance(w, (QSpinBox, QDoubleSpinBox)):
                 w.setValue(val)
             elif isinstance(w, QComboBox):
                 choices = spec.get("choices", [])
@@ -3640,6 +3650,13 @@ class TiffViewerApp(QMainWindow):
         self._crop_draw_start = None
         self._crop_region_snapshot = None
 
+        # Straighten Mode state (UI only — the angle lives in StraightenOp).
+        # _rotate_snapshot is (angle, enabled) to restore on cancel, or None
+        # when the op did not exist before the mode was entered.
+        self.rotate_mode = False
+        self._rotate_snapshot = None
+        self._rotate_grid_auto = True   # pick a grid spacing from the frame size once
+
         self.bit_depth_max = 4095
         self.vmin = 0
         self.vmax = 4095
@@ -3694,6 +3711,51 @@ class TiffViewerApp(QMainWindow):
         self.status_label = QLabel(f"Please open a specific TIFF file from the File menu ({_mod}+O).")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.status_label)
+
+        # --- Straighten Mode bar (hidden outside the mode) ----------------
+        self.rotate_bar = QFrame()
+        rot_row = QHBoxLayout(self.rotate_bar)
+        rot_row.setContentsMargins(6, 0, 6, 0)
+        rot_row.setSpacing(8)
+        rot_row.addWidget(QLabel("Angle:"))
+        self.rotate_angle_spin = QDoubleSpinBox()
+        self.rotate_angle_spin.setRange(-45.0, 45.0)
+        self.rotate_angle_spin.setDecimals(2)
+        self.rotate_angle_spin.setSingleStep(0.1)
+        self.rotate_angle_spin.setSuffix("°")
+        self.rotate_angle_spin.setToolTip(
+            "Positive turns the image clockwise, negative anticlockwise.\n"
+            "With the image focused: ↑/↓ nudge by 0.1°, Shift+↑/↓ by 0.01°."
+        )
+        self.rotate_angle_spin.valueChanged.connect(self._set_straighten_angle)
+        rot_row.addWidget(self.rotate_angle_spin)
+        rot_row.addWidget(QLabel("Grid:"))
+        self.rotate_grid_spin = QSpinBox()
+        self.rotate_grid_spin.setRange(5, 5000)
+        self.rotate_grid_spin.setSingleStep(10)
+        self.rotate_grid_spin.setValue(100)
+        self.rotate_grid_spin.setSuffix(" px")
+        self.rotate_grid_spin.setToolTip("Spacing of the alignment grid.")
+        self.rotate_grid_spin.valueChanged.connect(lambda _v: self._update_rotate_overlay())
+        rot_row.addWidget(self.rotate_grid_spin)
+        for text, tip, slot in (
+            ("Level from Line…",
+             "Click two points along a feature that should be horizontal or\n"
+             "vertical (e.g. a wall). The angle is set so that it becomes so.",
+             self._rotate_level_from_line),
+            ("Reset", "Set the angle back to 0°.", lambda: self._set_straighten_angle(0.0)),
+            ("Apply", "Keep this angle (Enter).", self._confirm_rotate),
+            ("Cancel", "Restore the previous angle (Esc).", self._cancel_rotate),
+        ):
+            btn = QPushButton(text)
+            btn.setToolTip(tip)
+            # NoFocus keeps Enter / Esc / arrows going to the main window.
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.clicked.connect(slot)
+            rot_row.addWidget(btn)
+        rot_row.addStretch()
+        self.rotate_bar.setVisible(False)
+        layout.addWidget(self.rotate_bar)
 
         self.glw = pg.GraphicsLayoutWidget()
         layout.addWidget(self.glw)
@@ -3765,6 +3827,20 @@ class TiffViewerApp(QMainWindow):
         self.block_grid_overlay.setZValue(7)
         self.block_grid_overlay.setVisible(False)
         self.view_box.addItem(self.block_grid_overlay)
+
+        # Straighten Mode: alignment grid + outline of the area autocrop keeps.
+        self.rotate_grid_overlay = pg.PlotCurveItem(
+            pen=pg.mkPen(color=(0, 220, 255, 150), width=1), connect='pairs'
+        )
+        self.rotate_grid_overlay.setZValue(7)
+        self.rotate_grid_overlay.setVisible(False)
+        self.view_box.addItem(self.rotate_grid_overlay)
+        self.rotate_keep_overlay = pg.PlotCurveItem(
+            pen=pg.mkPen(color=(255, 220, 0), width=2, style=Qt.PenStyle.DashLine)
+        )
+        self.rotate_keep_overlay.setZValue(7)
+        self.rotate_keep_overlay.setVisible(False)
+        self.view_box.addItem(self.rotate_keep_overlay)
 
         self.glw.scene().sigMouseMoved.connect(self.on_mouse_moved)
         self.glw.viewport().installEventFilter(self)
@@ -3843,6 +3919,15 @@ class TiffViewerApp(QMainWindow):
             return 0
         return op.params["k"]
 
+    def _geometry_idx(self) -> int:
+        """Index of the op whose output is the "raw" frame the probe, the
+        histogram and crop coordinates refer to: StraightenOp if present,
+        else RotateOp, else -1 (the frame as loaded)."""
+        idx, _ = self._find_op(StraightenOp)
+        if idx < 0:
+            idx, _ = self._find_op(RotateOp)
+        return idx
+
     def _clear_bg_if_upstream_changed(self, changed_idx: int) -> None:
         """Clear stored background when an op at or before BgSubtractOp changes."""
         bg_idx, bg_op = self._find_op(BgSubtractOp)
@@ -3872,6 +3957,14 @@ class TiffViewerApp(QMainWindow):
             crop_idx, _ = self._find_op(CropOp)
             if crop_idx >= 0:
                 stop_at = min(stop_at, crop_idx)
+
+        # Straighten Mode stops at StraightenOp's input, whatever stage is
+        # otherwise selected; update_frame_display then rotates that frame
+        # itself, uncropped, so the kept rectangle can be outlined.
+        if self.rotate_mode:
+            st_idx, _ = self._find_op(StraightenOp)
+            if st_idx >= 0:
+                stop_at = st_idx
 
         if stop_at == 0:
             return -2
@@ -4057,6 +4150,15 @@ class TiffViewerApp(QMainWindow):
         rotate_action.setShortcut("Ctrl+R")
         rotate_action.triggered.connect(self.rotate_image)
         view_menu.addAction(rotate_action)
+
+        self.rotate_mode_action = QAction("Straighten Mode", self, checkable=True)
+        self.rotate_mode_action.setShortcut("Ctrl+Shift+R")
+        self.rotate_mode_action.triggered.connect(self.toggle_rotate_mode)
+        view_menu.addAction(self.rotate_mode_action)
+
+        apply_rotation_action = QAction("Apply Rotation to Files...", self)
+        apply_rotation_action.triggered.connect(self.apply_rotation_dialog)
+        view_menu.addAction(apply_rotation_action)
 
         view_menu.addSeparator()
 
@@ -4289,6 +4391,8 @@ class TiffViewerApp(QMainWindow):
             ("Ctrl+Shift+C", "Toggle crop mode"),
             ("Ctrl+Shift+X", "Clear crop"),
             ("Enter / Esc", "Confirm / cancel ROI"),
+            ("Ctrl+Shift+R", "Toggle straighten mode (fine rotation)"),
+            ("↑ / ↓", "Straighten mode: nudge angle 0.1° (Shift: 0.01°)"),
         ]),
         ("Measurement", [
             ("Ctrl+M", "Set pixel scale"),
@@ -4382,7 +4486,8 @@ class TiffViewerApp(QMainWindow):
         if self.current_raw_frame is not None:
             _sample_frame = self.current_raw_frame
             for _op in _upstream_preview:
-                if not isinstance(_op, RotateOp):  # RotateOp already applied to current_raw_frame
+                # RotateOp / StraightenOp are already applied to current_raw_frame
+                if not isinstance(_op, (RotateOp, StraightenOp)):
                     _sample_frame = _op.apply(_sample_frame)
             H, W = _sample_frame.shape[:2]
         else:
@@ -4705,6 +4810,8 @@ class TiffViewerApp(QMainWindow):
             with open(path) as f:
                 text = f.read()
             new_pipeline = Pipeline.from_json(text)
+            if self.rotate_mode:
+                self._exit_rotate_mode(refresh=False)
             self.pipeline = new_pipeline
             self._invalidate_threshold_caches()
             self.pipeline_panel.rebuild_list()
@@ -4746,6 +4853,204 @@ class TiffViewerApp(QMainWindow):
         self.pipeline_panel.rebuild_list()
         self.update_frame_display()
         self.reset_view()
+
+    # ------------------------------------------------------------------
+    # Straighten Mode (fine rotation → StraightenOp params)
+    # ------------------------------------------------------------------
+
+    def _ensure_straighten_op(self):
+        """Return (idx, op), inserting a StraightenOp right after RotateOp
+        (or first in the pipeline) when none exists."""
+        idx, op = self._find_op(StraightenOp)
+        if op is not None:
+            return idx, op
+        rot_idx, _ = self._find_op(RotateOp)
+        op = StraightenOp()
+        idx = self.pipeline.add_operation(op, at_idx=rot_idx + 1)
+        self.pipeline_panel.rebuild_list()
+        return idx, op
+
+    def _set_straighten_angle(self, angle):
+        if self.sequence_manager is None:
+            return
+        # + 0.0 turns a rounded -0.0 into 0.0 so the box never reads "-0.00°".
+        angle = round(max(-45.0, min(45.0, float(angle))), 2) + 0.0
+        idx, op = self._ensure_straighten_op()
+        was_enabled = op.enabled
+        op.params["angle"] = angle
+        op.enabled = True
+        self.pipeline._invalidate_from(idx)
+        self._clear_bg_if_upstream_changed(idx)
+        self._invalidate_threshold_caches()
+        if not was_enabled:
+            self.pipeline_panel.rebuild_list()
+        self.rotate_angle_spin.blockSignals(True)
+        self.rotate_angle_spin.setValue(angle)
+        self.rotate_angle_spin.blockSignals(False)
+        pw = self.pipeline_panel.params_scroll.widget()
+        if isinstance(pw, ParamsWidget) and pw.op is op:
+            pw.refresh()
+        self.update_frame_display()
+
+    def toggle_rotate_mode(self, checked):
+        if self.sequence_manager is None or self.current_raw_frame is None:
+            self.rotate_mode_action.setChecked(False)
+            return
+        if not checked:
+            self._confirm_rotate()
+            return
+        if self.crop_mode:
+            self._confirm_crop()
+        if self.measure_mode:
+            self._exit_measure_mode(committed_px=None)
+
+        _, op = self._find_op(StraightenOp)
+        self._rotate_snapshot = None if op is None else (op.params["angle"], op.enabled)
+        _, op = self._ensure_straighten_op()
+        self.rotate_mode = True
+        self.rotate_mode_action.setChecked(True)
+        self.rotate_angle_spin.blockSignals(True)
+        self.rotate_angle_spin.setValue(op.params["angle"])
+        self.rotate_angle_spin.blockSignals(False)
+        self.rotate_bar.setVisible(True)
+        self.update_frame_display()
+        if self._rotate_grid_auto and self._display_hw is not None:
+            # About ten cells across the short side, on a round number.
+            self._rotate_grid_auto = False
+            self.rotate_grid_spin.setValue(max(10, round(min(self._display_hw) / 100) * 10))
+        self.view_box.autoRange()
+
+    def _exit_rotate_mode(self, refresh=True):
+        self.rotate_mode = False
+        self._rotate_snapshot = None
+        self.rotate_mode_action.setChecked(False)
+        self.rotate_bar.setVisible(False)
+        self._update_rotate_overlay()
+        if self.measure_mode:
+            self._exit_measure_mode(committed_px=None)
+        if refresh:
+            self.update_frame_display()
+            self.view_box.autoRange()
+
+    def _confirm_rotate(self):
+        idx, op = self._find_op(StraightenOp)
+        if op is not None:
+            if op.params["angle"] == 0 and self._rotate_snapshot is None:
+                # Entered and left without rotating: don't leave a no-op stage behind.
+                self.pipeline.remove_operation(idx)
+                self.pipeline_panel.rebuild_list()
+            elif not op.enabled:
+                op.enabled = True
+                self.pipeline._invalidate_from(idx)
+                self._clear_bg_if_upstream_changed(idx)
+                self._invalidate_threshold_caches()
+                self.pipeline_panel.rebuild_list()
+        self._exit_rotate_mode()
+
+    def _cancel_rotate(self):
+        idx, op = self._find_op(StraightenOp)
+        snap = self._rotate_snapshot
+        if op is not None:
+            if snap is None:
+                self.pipeline.remove_operation(idx)
+            else:
+                op.params["angle"], op.enabled = snap
+                self.pipeline._invalidate_from(idx)
+            self.pipeline_panel.rebuild_list()
+        self._exit_rotate_mode()
+
+    def _update_rotate_overlay(self):
+        """Alignment grid (centred on the rotation centre) and, with autocrop,
+        the outline of the area that survives the rotation."""
+        if not self.rotate_mode or self._display_hw is None:
+            self.rotate_grid_overlay.setVisible(False)
+            self.rotate_keep_overlay.setVisible(False)
+            return
+        H, W = self._display_hw
+        spacing = self.rotate_grid_spin.value()
+        cx, cy = W / 2.0, H / 2.0
+        xs, ys = [], []
+        for x in np.arange(cx % spacing, W + 1e-6, spacing):
+            xs += [x, x]
+            ys += [0, H]
+        for y in np.arange(cy % spacing, H + 1e-6, spacing):
+            xs += [0, W]
+            ys += [y, y]
+        self.rotate_grid_overlay.setData(x=np.array(xs, dtype=float), y=np.array(ys, dtype=float))
+        self.rotate_grid_overlay.setVisible(True)
+
+        _, op = self._find_op(StraightenOp)
+        if op is None or op.params["angle"] == 0 or op.params["edges"] != "autocrop":
+            self.rotate_keep_overlay.setVisible(False)
+            return
+        cw, ch = straighten_valid_size(W, H, op.params["angle"])
+        x0, y0 = (W - cw) // 2, (H - ch) // 2
+        self.rotate_keep_overlay.setData(
+            x=np.array([x0, x0 + cw, x0 + cw, x0, x0], dtype=float),
+            y=np.array([y0, y0, y0 + ch, y0 + ch, y0], dtype=float),
+        )
+        self.rotate_keep_overlay.setVisible(True)
+
+    def _rotate_level_from_line(self):
+        if not self.rotate_mode or self.measure_mode:
+            return
+        self._enter_measure_mode(
+            self._on_level_line,
+            first_hint="Level from line: click one end of a feature that should be "
+                       "horizontal or vertical. Esc to cancel.",
+            second_hint="Click the other end — the further apart the points, the more "
+                        "accurate the angle. Esc to cancel.",
+        )
+
+    def _on_level_line(self, committed_px):
+        line = self._measure_last_line
+        if committed_px is None or line is None or not self.rotate_mode:
+            return
+        x0, y0, x1, y1 = line
+        # y grows downward on screen, so atan2 is already "degrees clockwise".
+        phi = float(np.degrees(np.arctan2(y1 - y0, x1 - x0)))
+        # Tilt from the nearest axis, in [-45, 45). The line was drawn on the
+        # frame as currently rotated, so the correction adds to that angle.
+        tilt = (phi + 45.0) % 90.0 - 45.0
+        self._set_straighten_angle(self.rotate_angle_spin.value() - tilt)
+
+    def apply_rotation_dialog(self):
+        if self.sequence_manager is None:
+            return
+        if self.rotate_mode:
+            self._confirm_rotate()
+        parts = []
+        for op in self.pipeline.operations:
+            if not op.enabled:
+                continue
+            if isinstance(op, RotateOp) and op.params["k"] % 4:
+                parts.append(f"Rotate {90 * (op.params['k'] % 4)}° clockwise")
+            elif isinstance(op, StraightenOp) and op.params["angle"] != 0:
+                edges = ("autocrop" if op.params["edges"] == "autocrop"
+                         else "same size, black corners")
+                parts.append(f"Straighten {op.params['angle']:+.2f}° ({edges})")
+        if not parts:
+            self.status_label.setText(
+                "No rotation to apply. Use Rotate 90° CW or Straighten Mode first.")
+            return
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Apply Rotation to Files")
+        msg.setText(
+            "Rotation: " + ", then ".join(parts) + "\n\n"
+            f"This will PERMANENTLY OVERWRITE all {self.num_frames} TIFF files in\n"
+            f"{self.sequence_manager.folder_path}\n\n"
+            "Straightening resamples every pixel, so it cannot be undone or "
+            "exactly reversed. Keep a copy of the originals if you may need them."
+        )
+        btn_all = msg.addButton("Overwrite All Frames", QMessageBox.ButtonRole.AcceptRole)
+        cancel = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(cancel)
+        msg.exec()
+        if msg.clickedButton() == btn_all:
+            self._bake_geometry_to_files(
+                range(self.num_frames), (RotateOp, StraightenOp), "rotation")
 
     # ------------------------------------------------------------------
     # Crop (UI draw state → CropOp params)
@@ -4807,6 +5112,8 @@ class TiffViewerApp(QMainWindow):
             return
 
         if checked:
+            if self.rotate_mode:
+                self._confirm_rotate()
             self._crop_region_snapshot = self._crop_region()
             self.glw.setCursor(Qt.CursorShape.CrossCursor)
             cr = self._crop_region()
@@ -4883,9 +5190,13 @@ class TiffViewerApp(QMainWindow):
             self._write_cropped_frames([self.current_frame])
 
     def _write_cropped_frames(self, indices):
-        cr = self._crop_region()
-        x, y, w, h = cr
-        rot_k = self._rotation_state()
+        self._bake_geometry_to_files(indices, (RotateOp, StraightenOp, CropOp), "crop")
+
+    def _bake_geometry_to_files(self, indices, classes, what):
+        """Overwrite the given frames on disk with the enabled ops of `classes`
+        applied in pipeline order, then drop those ops — they are baked in."""
+        ops = [op for op in self.pipeline.operations
+               if isinstance(op, classes) and op.enabled]
         index_list = list(indices)
         total = len(index_list)
 
@@ -4893,16 +5204,15 @@ class TiffViewerApp(QMainWindow):
             self.status_label.setText(f"Writing frame {i + 1} / {total}...")
             QApplication.processEvents()
             file_path = os.path.join(self.sequence_manager.folder_path, self.sequence_manager.files[idx])
-            raw = tifffile.imread(file_path)
-            rotated = np.rot90(raw, k=-rot_k)
-            cropped = rotated[y:y + h, x:x + w]
-            tifffile.imwrite(file_path, cropped)
+            out = tifffile.imread(file_path)
+            for op in ops:
+                out = op.apply(out)
+            tifffile.imwrite(file_path, out)
 
         self.sequence_manager.cache.clear()
-        # remove RotateOp and CropOp — baked in
         self.pipeline.operations = [
             op for op in self.pipeline.operations
-            if not isinstance(op, (RotateOp, CropOp))
+            if not isinstance(op, classes)
         ]
         self.pipeline._caches = [{} for _ in self.pipeline.operations]
         _, bg_op = self._find_op(BgSubtractOp)
@@ -4915,7 +5225,7 @@ class TiffViewerApp(QMainWindow):
         self.sequence_manager.prefetch_window(self.current_frame)
         self.update_frame_display()
         self.view_box.autoRange()
-        self.status_label.setText(f"Done. {total} frame(s) overwritten with crop applied.")
+        self.status_label.setText(f"Done. {total} frame(s) overwritten with {what} applied.")
 
     # ------------------------------------------------------------------
     # Rays
@@ -4973,6 +5283,9 @@ class TiffViewerApp(QMainWindow):
         k = rot_op.params.get("k", 0) if (rot_op is not None and rot_op.enabled) else 0
         region = self._crop_region()
         crop = "none" if region is None else ",".join(str(v) for v in region)
+        _, st_op = self._find_op(StraightenOp)
+        if st_op is not None and st_op.enabled and st_op.params["angle"] != 0:
+            return f"rot{k}|straighten{st_op.params['angle']:.2f},{st_op.params['edges']}|crop{crop}"
         return f"rot{k}|crop{crop}"
 
     def active_facet_session(self):
@@ -5269,6 +5582,8 @@ class TiffViewerApp(QMainWindow):
         if self.pipeline.scale is not None:
             s = self.pipeline.scale
             text += f"   |  Scale: {s['px']} px = {_fmt_num(s['value'])} {s['unit']}"
+        if self.rotate_mode:
+            text += "   |  Straighten: ↑/↓ nudge angle, Enter=apply, Esc=cancel"
         self.status_label.setText(text)
 
     def clear_scale(self):
@@ -5363,10 +5678,15 @@ class TiffViewerApp(QMainWindow):
 
         dlg.exec()
 
-    def _enter_measure_mode(self, callback):
+    def _enter_measure_mode(self, callback, first_hint=None, second_hint=None):
         self.measure_mode = 'await_first'
         self._measure_first_pt = None
         self._measure_pending_callback = callback
+        self._measure_second_hint = second_hint
+        # Unrounded (x0, y0, x1, y1) of the last committed line, for callers
+        # that need its direction rather than its whole-pixel length.
+        self._measure_first_raw = None
+        self._measure_last_line = None
         if self._measure_line_item is not None:
             self.view_box.removeItem(self._measure_line_item)
             self._measure_line_item = None
@@ -5374,7 +5694,8 @@ class TiffViewerApp(QMainWindow):
             self.view_box.removeItem(self._measure_label_item)
             self._measure_label_item = None
         self.glw.setCursor(Qt.CursorShape.CrossCursor)
-        self.status_label.setText("Click first point of measurement line. Esc to cancel.")
+        self.status_label.setText(
+            first_hint or "Click first point of measurement line. Esc to cancel.")
 
     def _exit_measure_mode(self, committed_px=None):
         self.measure_mode = False
@@ -5396,6 +5717,7 @@ class TiffViewerApp(QMainWindow):
         x = int(round(img_pos.x()))
         y = int(round(img_pos.y()))
         self._measure_first_pt = (x, y)
+        self._measure_first_raw = (img_pos.x(), img_pos.y())
         self._measure_line_item = pg.PlotDataItem(
             x=[x, x], y=[y, y],
             pen=pg.mkPen(color=(255, 230, 0), width=2),
@@ -5411,7 +5733,8 @@ class TiffViewerApp(QMainWindow):
         self.view_box.addItem(self._measure_label_item)
         self.measure_mode = 'await_second'
         self.status_label.setText(
-            "Click second point. Hold Shift for horizontal / vertical. Esc to cancel."
+            self._measure_second_hint
+            or "Click second point. Hold Shift for horizontal / vertical. Esc to cancel."
         )
 
     def _measure_update_endpoint(self, img_pos, shift_held):
@@ -5446,6 +5769,7 @@ class TiffViewerApp(QMainWindow):
                 "Zero-length line — click a different second point. Esc to cancel."
             )
             return
+        self._measure_last_line = (*self._measure_first_raw, img_pos.x(), img_pos.y())
         self._exit_measure_mode(committed_px=length)
 
     # ------------------------------------------------------------------
@@ -5563,9 +5887,16 @@ class TiffViewerApp(QMainWindow):
             with self.perf.span("setup + cache_tags"):
                 # Single pipeline walk — captures display frame, pixel-probe frame, and
                 # histogram frame in one pass rather than three separate apply_to_frame calls.
-                rot_idx, _ = self._find_op(RotateOp)
+                # "rot" here means the last geometry op (RotateOp / StraightenOp).
+                rot_idx = self._geometry_idx()
                 bg_idx, _ = self._find_op(BgSubtractOp)
                 disp_target = self._display_target_stage()
+                st_preview_op = None
+                if self.rotate_mode:
+                    st_idx, st_preview_op = self._find_op(StraightenOp)
+                    if st_preview_op is not None:
+                        # Walk no further than the op's input (disp_target).
+                        rot_idx, bg_idx = st_idx - 1, -1
 
                 # Invalidate OF display cache when pipeline state or disp_target changes.
                 _of_tag = str(disp_target) + ":" + "|".join(
@@ -5621,6 +5952,9 @@ class TiffViewerApp(QMainWindow):
             self.current_raw_frame = snapshots.get(
                 -1 if rot_idx < 0 else rot_idx, base_raw_frame
             )
+            if st_preview_op is not None:
+                display_frame = st_preview_op.rotate(display_frame, crop=False)
+                self.current_raw_frame = display_frame
             self._last_frame_for_histogram = (
                 snapshots.get(bg_idx, self.current_raw_frame) if bg_idx >= 0
                 else self.current_raw_frame
@@ -5644,11 +5978,14 @@ class TiffViewerApp(QMainWindow):
                 self.image_item.setImage(frame_8bit.T, autoLevels=False)
             with self.perf.span("block_grid"):
                 self._update_block_grid()
+                self._update_rotate_overlay()
 
             # threshold overlay
             with self.perf.span("threshold_overlay (total)"):
                 thresh_idx, thresh_op = self._find_threshold_op()
-                if thresh_op is not None and thresh_op.enabled:
+                # No overlay in Straighten Mode: display_frame is the bare rotated
+                # frame there, not the input the threshold op expects.
+                if thresh_op is not None and thresh_op.enabled and not self.rotate_mode:
                     cached = self.pipeline.get_batch_cache(thresh_idx, self.current_frame)
                     if cached is not None:
                         mask = cached
@@ -5709,7 +6046,7 @@ class TiffViewerApp(QMainWindow):
                     self.threshold_overlay.clear()
 
             # optical flow
-            if self.optical_flow_enabled:
+            if self.optical_flow_enabled and not self.rotate_mode:
                 with self.perf.span("optical_flow (total)"):
                     def _of_get(idx: int):
                         """Return pipeline display frame for idx, using display cache when available."""
@@ -5908,6 +6245,9 @@ class TiffViewerApp(QMainWindow):
             self.clear_all_facet_sessions()
             if self.measure_mode:
                 self._exit_measure_mode(committed_px=None)
+            if self.rotate_mode:
+                self._exit_rotate_mode(refresh=False)
+            self._rotate_grid_auto = True
             self._of_display_cache.clear()
             self._of_cache_tag = ""
             self._of_flow_cache.clear()
@@ -5965,7 +6305,7 @@ class TiffViewerApp(QMainWindow):
         x, y = int(mouse_point.x()), int(mouse_point.y())
 
         cr = self._crop_region()
-        crop_op_enabled = cr is not None and not self.crop_mode
+        crop_op_enabled = cr is not None and not self.crop_mode and not self.rotate_mode
         if crop_op_enabled:
             cx, cy, cw, ch = cr
             disp_w, disp_h = cw, ch
@@ -6006,6 +6346,25 @@ class TiffViewerApp(QMainWindow):
                 self._exit_facet_mode()
                 self.refresh_facets()
                 self._refresh_status_label()
+                return
+
+        if self.rotate_mode:
+            key = event.key()
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                # Enter inside the angle / grid box only commits the typed
+                # value; a second Enter (focus now on the window) applies.
+                if QApplication.focusWidget() in (self.rotate_angle_spin, self.rotate_grid_spin):
+                    self.setFocus()
+                else:
+                    self._confirm_rotate()
+                return
+            if key == Qt.Key.Key_Escape:
+                self._cancel_rotate()
+                return
+            if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                step = 0.01 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 0.1
+                sign = 1 if key == Qt.Key.Key_Up else -1
+                self._set_straighten_angle(self.rotate_angle_spin.value() + sign * step)
                 return
 
         if self.crop_mode:
